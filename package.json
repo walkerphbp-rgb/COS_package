@@ -1,0 +1,13 @@
+{
+  "name": "cos-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chief of Staff backend + operator dashboard",
+  "main": "cos_backend.js",
+  "scripts": {
+    "start": "node cos_backend.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

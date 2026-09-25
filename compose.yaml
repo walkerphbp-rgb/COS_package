@@ -1,0 +1,14 @@
+# Local container test only (platform-neutral). Usage:
+#   COS_TOKEN=$(openssl rand -hex 24) docker compose up --build
+services:
+  cos:
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      COS_TOKEN: ${COS_TOKEN:?set COS_TOKEN to a random secret of at least 24 characters}
+      COS_MODE: ${COS_MODE:-MOCK}
+    volumes:
+      - cos-data:/data
+volumes:
+  cos-data:
