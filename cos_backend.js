@@ -1,9 +1,18 @@
 #!/usr/bin/env node
 /**
- * Chief of Staff — dashboard backend (v1.1, deployable)
+ * Chief of Staff — dashboard backend (v1.2, deployable)
  *
- * Serves the two API endpoints the operator dashboard expects:
+ * Serves the three API endpoints the operator dashboard / Test 19 expect:
  *   GET  /api/snapshot                 (bearer token required)
+ *   POST /api/missions                 (bearer token required, Test 19)
+ *                                      { "objective": string, "nonce": string }
+ *                                      Runs a REAL mission through the real
+ *                                      Researcher->Analyst->Creator->Critic
+ *                                      chain (mission_chain.js) against real
+ *                                      Gemini/Groq. No mock path exists here —
+ *                                      if GEMINI_API_KEY is unset this route
+ *                                      fails with 503 rather than faking a
+ *                                      result.
  *   POST /api/missions/:id/decision    (bearer token required)
  *                                      { "decision": "APPROVED" | "REJECTED" }
  * and, unauthenticated, two things that carry no mission data:
@@ -57,6 +66,15 @@
  *   COS_ALLOWED_ORIGINS  comma list; default * (safe: auth is a header token,
  *                        no cookies)
  *   COS_GEMINI_MODEL / COS_GROQ_MODEL   model labels shown in provider calls
+ *   GEMINI_API_KEY       required for POST /api/missions (Test 19). Without
+ *                        it that route returns 503. Never returned by any
+ *                        endpoint, never logged.
+ *   GROQ_API_KEY         optional fallback provider for POST /api/missions.
+ *                        Without it, a Gemini failure just fails the call
+ *                        (no fallback), same as a 1-provider list elsewhere.
+ *   COS_MISSION_SEED_URL server-side (no-CORS) grounding URL the Researcher
+ *                        fetches for every POST /api/missions call (default:
+ *                        the same public README used by Test 17 --live)
  *
  * NOTE: test17_final_acceptance.js DELETES its DB on every run. Stop this
  * server first, or just restart it after; it opens the DB per request so a
@@ -68,10 +86,15 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
+const { runLiveMission } = require('./mission_chain');
 
 const DB_PATH = path.resolve(process.env.COS_DB || path.join(__dirname, 'test17.db'));
 const PORT = Number(process.env.PORT || process.env.COS_PORT || 8787);
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const MISSION_SEED_URL = process.env.COS_MISSION_SEED_URL
+  || 'https://raw.githubusercontent.com/anthropics/anthropic-sdk-typescript/main/README.md';
 const READONLY = process.env.COS_READONLY === '1';
 const INIT_DB = process.env.COS_INIT_DB === '1';
 const SCHEMA_PATH = path.resolve(process.env.COS_SCHEMA || path.join(__dirname, 'test17_schema.sql'));
@@ -392,6 +415,30 @@ const server = http.createServer(async (req, res) => {
     if (!actor) { if (url.pathname.startsWith('/api/')) logAuthFailure(`${req.method} ${url.pathname}`); return send(res, 401, { ok: false, error: 'Missing or invalid bearer token' }); }
 
     if (req.method === 'GET' && url.pathname === '/api/snapshot') return send(res, 200, buildSnapshot());
+
+    if (req.method === 'POST' && url.pathname === '/api/missions') {
+      if (READONLY) return send(res, 403, { ok: false, error: 'Backend is in read-only (evidence) mode; no mission can be run' });
+      if (!GEMINI_API_KEY) return send(res, 503, { ok: false, error: 'GEMINI_API_KEY not configured on the server — cannot run a live mission' });
+      let body; try { body = JSON.parse(await readBody(req) || '{}'); } catch { return send(res, 400, { ok: false, error: 'Invalid JSON' }); }
+      const objective = typeof body.objective === 'string' ? body.objective.trim() : '';
+      const nonce = typeof body.nonce === 'string' ? body.nonce.trim() : '';
+      if (objective.length < 10 || objective.length > 2000) return send(res, 400, { ok: false, error: 'objective must be 10-2000 characters' });
+      if (!/^[A-Za-z0-9_-]{6,64}$/.test(nonce)) return send(res, 400, { ok: false, error: 'nonce is required: 6-64 chars, letters/digits/_/- only' });
+      const db = open(true);
+      try {
+        const result = await runLiveMission(db, {
+          requestText: objective, nonce, seedUrl: MISSION_SEED_URL,
+          keys: { gemini: GEMINI_API_KEY, groq: GROQ_API_KEY || null },
+          models: MODELS,
+        });
+        logEvent(result.missionId, 'MISSION_SUBMITTED',
+          `by ${actor}, outcome=${result.outcome}, provider_used=${result.providerUsed}, nonce_verified=${result.nonceVerifiedInProviderResponse && result.nonceVerifiedInArtifact}`, actor);
+        return send(res, 201, { ok: true, ...result });
+      } catch (e) {
+        logEvent(null, 'MISSION_FAILED', `by ${actor}: ${e.message}`, actor);
+        return send(res, 502, { ok: false, error: e.message });
+      } finally { try { db.close(); } catch {} }
+    }
 
     const m = /^\/api\/missions\/([A-Za-z0-9_-]{1,64})\/decision$/.exec(url.pathname);
     if (req.method === 'POST' && m) {
