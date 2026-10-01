@@ -199,6 +199,7 @@ function logAuthFailure(detail) {
 /* ---------------- snapshot ---------------- */
 const IN_PROGRESS = new Set(['RESEARCHED', 'ANALYZED', 'ARTIFACT_DRAFTED', 'ARTIFACT_VERIFIED']);
 const EVENT_NAME = { RESEARCHED: 'RESEARCH_COMPLETED', AWAITING_APPROVAL: 'APPROVAL_REQUESTED' };
+const BENIGN_EVENTS = new Set(['MISSION_SUBMITTED']);
 const INJECTION = [/ignore\s+(all\s+|previous\s+|prior\s+)?instructions/i, /pre[-\s]?approved/i,
   /set\s+risk_tier\s*=\s*low/i, /bypass\s+approval/i, /auto[-\s]?approve/i];
 const injected = t => INJECTION.some(re => re.test(t || ''));
@@ -281,7 +282,7 @@ function buildSnapshot() {
       ...decisions.map(d => ({ ts: d.created_at, mission_id: d.mission_id, event: EVENT_NAME[d.status] || d.status,
         detail: d.rationale, violation: false })),
       ...beEvents.map(e => ({ ts: e.created_at, mission_id: e.mission_id || '', event: e.event,
-        detail: e.detail + (e.actor ? ` (by ${e.actor})` : ''), violation: true })),
+        detail: e.detail + (e.actor ? ` (by ${e.actor})` : ''), violation: !BENIGN_EVENTS.has(e.event) })),
     ].sort((a, b) => new Date(b.ts) - new Date(a.ts)).slice(0, 200);
 
     const lastActivity = s => { const c = calls.filter(x => x.specialist === s).pop();
