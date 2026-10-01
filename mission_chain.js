@@ -231,7 +231,9 @@ async function runAnalyst(db, { missionId, callSeq, requestText, claimIds, keys,
     INSERT INTO recommendations (mission_id, provider_call_id, claim_ids, summary, llm_self_tier, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(missionId, providerCallId, JSON.stringify(claimIds), result.response.summary, result.response.llm_self_tier, nowISO());
-
+const cur = db.prepare(`SELECT risk_tier FROM missions WHERE id = ?`).get(missionId).risk_tier;
+riskTier = maxTier(cur, riskTier);
+db.prepare(`UPDATE missions SET risk_tier = ? WHERE id = ?`).run(riskTier, missionId);
   db.prepare(`UPDATE missions SET risk_tier = ? WHERE id = ?`).run(riskTier, missionId);
   const usage = result.response && result.response.__usage ? result.response.__usage : null;
   recordDecision(db, missionId, 'ANALYZED',
