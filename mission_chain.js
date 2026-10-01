@@ -354,4 +354,4 @@ async function runLiveMission(db, { requestText, nonce, seedUrl, keys, models })
   };
 }
 
-module.exports = { runLiveMission, execute, computeRiskTierFromClaims, containsInjectionPattern };
+module.exports = { runLiveMission, runAnalyst, execute, computeRiskTierFromClaims, containsInjectionPattern };
