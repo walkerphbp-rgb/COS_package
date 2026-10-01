@@ -1,11 +1,15 @@
 name: tier-rules
 on: workflow_dispatch
+
 jobs:
-  test:
+  tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: node test19b_tier_rules.js
+      - name: Run 19b
+        run: node test19b_tier_rules.js
+      - name: Run 19c
+        run: node test19c_runanalyst_regression.js
