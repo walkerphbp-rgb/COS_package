@@ -312,7 +312,7 @@ async function runLiveMission(db, { requestText, nonce, seedUrl, keys, models })
   db.prepare(`INSERT INTO missions (id, request_text, status, risk_tier, created_at) VALUES (?, ?, 'PROPOSED', 'low', ?)`)
     .run(missionId, requestText, nowISO());
   recordDecision(db, missionId, 'PROPOSED', requestText);
-
+try {
   const research = await runResearcher(db, { missionId, callSeq: 1, requestText, nonce, seedUrl, keys, models });
   const claims = research.claimIds.map((id) => db.prepare(`SELECT * FROM claims WHERE id = ?`).get(id));
   const analysis = await runAnalyst(db, { missionId, callSeq: 2, requestText, claimIds: research.claimIds, keys, models });
@@ -320,7 +320,9 @@ async function runLiveMission(db, { requestText, nonce, seedUrl, keys, models })
   const criticVerdict = runCritic(db, {
     missionId, artifactId: creation.artifactId, claims,
     grounded: claims.length > 0, nonceInPayload: creation.nonceInPayload,
-  });
+   ```js
+    } catch (e) { e.missionId = missionId; throw e; }
+  ``` });
 
   const riskTier = db.prepare(`SELECT risk_tier FROM missions WHERE id = ?`).get(missionId).risk_tier;
   const autoEligible = riskTier === 'low' && criticVerdict === 'PASS';
