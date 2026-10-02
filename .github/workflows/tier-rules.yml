@@ -13,3 +13,5 @@ jobs:
         run: node test19b_tier_rules.js
       - name: Run 19c
         run: node test19c_runanalyst_regression.js
+      - name: Run 19d
+        run: node test19d_mission_failure.js
