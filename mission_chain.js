@@ -320,9 +320,9 @@ try {
   const criticVerdict = runCritic(db, {
     missionId, artifactId: creation.artifactId, claims,
     grounded: claims.length > 0, nonceInPayload: creation.nonceInPayload,
-   ```js
+  
     } catch (e) { e.missionId = missionId; throw e; }
-  ``` });
+   });
 
   const riskTier = db.prepare(`SELECT risk_tier FROM missions WHERE id = ?`).get(missionId).risk_tier;
   const autoEligible = riskTier === 'low' && criticVerdict === 'PASS';
