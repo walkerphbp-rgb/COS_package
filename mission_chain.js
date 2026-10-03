@@ -320,9 +320,7 @@ try {
   const criticVerdict = runCritic(db, {
     missionId, artifactId: creation.artifactId, claims,
     grounded: claims.length > 0, nonceInPayload: creation.nonceInPayload,
-  
-    } catch (e) { e.missionId = missionId; throw e; }
-   });
+  });
 
   const riskTier = db.prepare(`SELECT risk_tier FROM missions WHERE id = ?`).get(missionId).risk_tier;
   const autoEligible = riskTier === 'low' && criticVerdict === 'PASS';
@@ -354,6 +352,7 @@ try {
     // backend rather than Google's separate usage dashboard.
     tokenUsage: { researcher: research.usage, analyst: analysis.usage, creator: creation.usage },
   };
+  } catch (e) { e.missionId = missionId; throw e; }
 }
 
 module.exports = { runLiveMission, runAnalyst, execute, computeRiskTierFromClaims, containsInjectionPattern };
