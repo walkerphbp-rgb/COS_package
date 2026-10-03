@@ -199,7 +199,7 @@ function logAuthFailure(detail) {
 /* ---------------- snapshot ---------------- */
 const IN_PROGRESS = new Set(['RESEARCHED', 'ANALYZED', 'ARTIFACT_DRAFTED', 'ARTIFACT_VERIFIED']);
 const EVENT_NAME = { RESEARCHED: 'RESEARCH_COMPLETED', AWAITING_APPROVAL: 'APPROVAL_REQUESTED' };
-const BENIGN_EVENTS = new Set(['MISSION_SUBMITTED']);
+const BENIGN_EVENTS = new Set(['MISSION_SUBMITTED', 'MISSION_FAILED']);
 const INJECTION = [/ignore\s+(all\s+|previous\s+|prior\s+)?instructions/i, /pre[-\s]?approved/i,
   /set\s+risk_tier\s*=\s*low/i, /bypass\s+approval/i, /auto[-\s]?approve/i];
 const injected = t => INJECTION.some(re => re.test(t || ''));
@@ -436,8 +436,17 @@ const server = http.createServer(async (req, res) => {
           `by ${actor}, outcome=${result.outcome}, provider_used=${result.providerUsed}, nonce_verified=${result.nonceVerifiedInProviderResponse && result.nonceVerifiedInArtifact}`, actor);
         return send(res, 201, { ok: true, ...result });
       } catch (e) {
-        logEvent(null, 'MISSION_FAILED', `by ${actor}: ${e.message}`, actor);
-        return send(res, 502, { ok: false, error: e.message });
+        const failedId = (e && e.missionId) || null;
+        // Decisions are append-only: record the terminal FAILED state as a new row
+        // so the snapshot stops showing the mission as IN_PROGRESS.
+        if (failedId) {
+          try {
+            db.prepare(`INSERT INTO decisions (mission_id,status,rationale,created_at) VALUES (?,?,?,?)`)
+              .run(failedId, 'FAILED', String(e.message).slice(0, 500), nowISO());
+          } catch { /* never mask the original error */ }
+        }
+        logEvent(failedId, 'MISSION_FAILED', `by ${actor}: ${e.message}`, actor);
+        return send(res, 502, { ok: false, error: e.message, mission_id: failedId });
       } finally { try { db.close(); } catch {} }
     }
 
