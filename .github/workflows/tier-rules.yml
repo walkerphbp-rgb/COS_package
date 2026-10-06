@@ -1,5 +1,9 @@
 name: tier-rules
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
 
 jobs:
   tests:
@@ -15,3 +19,16 @@ jobs:
         run: node test19c_runanalyst_regression.js
       - name: Run 19d
         run: node test19d_mission_failure.js
+      - name: Run 20 (fixed gate)
+        run: node test20_gate.js fixed
+      - name: Run 21 (integration)
+        run: node test21_integration.js
+      - name: Run 22 (grounding, fixed)
+        run: node test22_grounding.js fixed
+      # Mutation checks: the same tests MUST fail against the old code, proving they detect the defects.
+      - name: Mutation check - gate original must FAIL
+        run: |
+          if node test20_gate.js original; then echo "test20 passed on the original gate: tests do not detect the defects"; exit 1; fi
+      - name: Mutation check - grounding original must FAIL
+        run: |
+          if node test22_grounding.js original; then echo "test22 passed on the original grounding: tests do not detect the defects"; exit 1; fi
