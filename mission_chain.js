@@ -178,6 +178,23 @@ async function fetchGrounding(seedUrl) {
   }
 }
 
+/* Code-enforced grounding. A claim counts as grounded ONLY if all hold:
+ *  1. the fetch succeeded (2xx, no error) and returned bytes: an HTTP error page is not evidence
+ *  2. claim.source_url is exactly the URL that was fetched (a wrong/invented URL is never grounded)
+ *  3. evidence_snippet is non-trivial (>= MIN_SNIPPET chars after whitespace normalisation): an
+ *     empty snippet must not pass an includes() check
+ *  4. the WHOLE snippet appears in the fetched content (whitespace-normalised on both sides),
+ *     not just a prefix: a real opening followed by a fabricated tail fails */
+const MIN_SNIPPET = 10;
+const normWs = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+function isGrounded(grounding, claim, seedUrl) {
+  if (!grounding || grounding.error || !(grounding.statusCode >= 200 && grounding.statusCode < 300) || !(grounding.bytes > 0)) return false;
+  if (!claim || claim.source_url !== seedUrl) return false;
+  const snip = normWs(claim.evidence_snippet);
+  if (snip.length < MIN_SNIPPET) return false;
+  return normWs(grounding.content).includes(snip);
+}
+
 async function runResearcher(db, { missionId, callSeq, requestText, nonce, seedUrl, keys, models }) {
   const grounding = await fetchGrounding(seedUrl);
   const prompt = `You are a research specialist. Task: ${requestText}\n\n` +
@@ -200,7 +217,7 @@ async function runResearcher(db, { missionId, callSeq, requestText, nonce, seedU
   for (const c of claims) {
     // Same code-enforced containment check as Test 17: a claim only counts as
     // grounded if its evidence_snippet is actually present in fetched bytes.
-    const fetchMatch = grounding.bytes > 0 && grounding.content.includes((c.evidence_snippet || '').slice(0, 30)) ? 1 : 0;
+    const fetchMatch = isGrounded(grounding, c, seedUrl) ? 1 : 0;
     const ins = db.prepare(`
       INSERT INTO claims (mission_id, provider_call_id, text, source_url, evidence_snippet, confidence, fetch_match, poisoned, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
@@ -356,4 +373,4 @@ try {
   } catch (e) { e.missionId = missionId; throw e; }
 }
 
-module.exports = { runLiveMission, runAnalyst, computeRiskTierFromClaims, containsInjectionPattern };
+module.exports = { runLiveMission, runAnalyst, runResearcher, isGrounded, computeRiskTierFromClaims, containsInjectionPattern };

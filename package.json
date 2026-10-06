@@ -1,11 +1,12 @@
 {
   "name": "cos-backend",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "private": true,
   "description": "Chief of Staff backend + operator dashboard",
   "main": "cos_backend.js",
   "scripts": {
-    "start": "node cos_backend.js"
+    "start": "node cos_backend.js",
+    "test": "node test19b_tier_rules.js && node test19c_runanalyst_regression.js && node test19d_mission_failure.js && node test20_gate.js fixed && node test21_integration.js && node test22_grounding.js fixed"
   },
   "engines": {
     "node": ">=22.5.0"
