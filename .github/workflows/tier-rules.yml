@@ -32,3 +32,7 @@ jobs:
       - name: Mutation check - grounding original must FAIL
         run: |
           if node test22_grounding.js original; then echo "test22 passed on the original grounding: tests do not detect the defects"; exit 1; fi
+      - name: Run 23 (persistence safety, local)
+        run: node test23_persistence.js
+      - name: Run 24 (entrypoint + Dockerfile readiness; behavioural half skips when not root)
+        run: node test24_entrypoint.js
