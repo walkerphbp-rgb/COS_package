@@ -1,0 +1,778 @@
+diff --git a/.github/workflows/tier-rules.yml b/.github/workflows/tier-rules.yml
+index 2669e59..932acfa 100644
+--- a/.github/workflows/tier-rules.yml
++++ b/.github/workflows/tier-rules.yml
+@@ -25,6 +25,10 @@ jobs:
+         run: node test21_integration.js
+       - name: Run 22 (grounding, fixed)
+         run: node test22_grounding.js fixed
++      - name: Run 23 (persistence safety, local)
++        run: node test23_persistence.js
++      - name: Run 24 (entrypoint + Dockerfile readiness; behavioural half skips when not root)
++        run: node test24_entrypoint.js
+       # Mutation checks: the same tests MUST fail against the old code, proving they detect the defects.
+       - name: Mutation check - gate original must FAIL
+         run: |
+diff --git a/Dockerfile b/Dockerfile
+index 9dba939..6eef8a5 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -6,20 +6,27 @@
+ 
+ FROM node:22-bookworm-slim
+ 
+-# Runs as the unprivileged "node" user by default. Some hosts mount volumes owned by root; if the
+-# logs say "unable to open database file" / EACCES on /data, rebuild with:  --build-arg RUN_AS=root
+-ARG RUN_AS=node
++# The entrypoint starts as root ONLY to chown the persistent directory (hosts mount a fresh disk
++# root-owned, and it cannot be fixed at build time), then drops to the unprivileged "node" user
++# (uid/gid 1000, override with COS_RUN_UID / COS_RUN_GID) before the server code loads. If the drop
++# fails it exits instead of running as root. `docker run --user node ...` also works (chown is skipped).
+ 
+ WORKDIR /app
+-COPY cos_backend.js chief_of_staff_dashboard.html test17_schema.sql mission_chain.js provider_fallback.js gate.js db_migrations.js ./
++COPY cos_backend.js chief_of_staff_dashboard.html test17_schema.sql mission_chain.js provider_fallback.js gate.js db_migrations.js persistence.js docker-entrypoint.js ./
+ 
+ # /data is where the SQLite file lives. Mount a PERSISTENT VOLUME here or every redeploy starts empty.
++# The persistence REQUIREMENT is deliberately NOT baked into the image: set COS_REQUIRE_PERSISTENT=1 in the
++# deployment environment (e.g. the Render service's env vars) so local `docker run` / compose still work
++# without a volume. In production, without it the server will happily write to ephemeral storage.
++# Note /data exists in the image even with no disk attached, so a guard alone cannot detect a missing
++# mount: /health reports root_on_separate_filesystem as evidence, and the redeploy test is the real proof.
+ RUN mkdir -p /data && chown -R node:node /data /app
+ VOLUME ["/data"]
+ 
+ ENV NODE_ENV=production \
+     COS_HOST=0.0.0.0 \
+-    COS_DB=/data/cos.db \
++    COS_DB_PATH=/data/cos.db \
++    COS_PERSISTENT_ROOT=/data \
+     COS_INIT_DB=1 \
+     COS_SCHEMA=/app/test17_schema.sql \
+     COS_DASHBOARD=/app/chief_of_staff_dashboard.html \
+@@ -29,10 +36,9 @@ ENV NODE_ENV=production \
+ 
+ # PORT (injected by most hosts) wins over COS_PORT; default 8787.
+ EXPOSE 8787
+-USER ${RUN_AS}
+ 
+ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||process.env.COS_PORT||8787)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+ 
+-CMD ["node", "cos_backend.js"]
++CMD ["node", "docker-entrypoint.js"]
+ 
+diff --git a/cos_backend.js b/cos_backend.js
+index c922474..0bdc78a 100644
+--- a/cos_backend.js
++++ b/cos_backend.js
+@@ -39,7 +39,13 @@
+  *  - The backend never sees or needs Gemini/Groq keys.
+  *
+  * Env:
+- *   COS_DB               path to SQLite file        (default ./test17.db)
++ *   COS_DB_PATH          path to SQLite file        (default ./cos.db beside this file).
++ *                        COS_DB is still honoured as a legacy alias.
++ *   COS_REQUIRE_PERSISTENT  1 = FAIL CLOSED at boot unless the DB path is inside
++ *                        COS_PERSISTENT_ROOT (root exists, DB dir writable). Production:
++ *                        COS_DB_PATH=/data/cos.db COS_PERSISTENT_ROOT=/data
++ *   COS_PERSISTENT_ROOT  the directory the platform persists (e.g. a Render disk mount)
++ *   COS_SHUTDOWN_GRACE_MS  SIGTERM/SIGINT drain window for in-flight requests (default 25000)
+  *   PORT / COS_PORT      listen port. PORT (set by most hosts) wins, then
+  *                        COS_PORT, then 8787.
+  *   COS_HOST             default 127.0.0.1  (0.0.0.0 inside a container/for LAN)
+@@ -88,9 +94,11 @@ const crypto = require('node:crypto');
+ const { DatabaseSync } = require('node:sqlite');
+ const { runLiveMission } = require('./mission_chain');
+ const { gateExecuteInTx } = require('./gate');
+-const { migrate, guardStatus } = require('./db_migrations');
++const { guardStatus, migrateVersioned, SCHEMA_VERSION } = require('./db_migrations');
++const persistence = require('./persistence');
+ 
+-const DB_PATH = path.resolve(process.env.COS_DB || path.join(__dirname, 'test17.db'));
++const PCFG = persistence.resolveConfig(process.env, __dirname);
++const DB_PATH = PCFG.dbPath;
+ const PORT = Number(process.env.PORT || process.env.COS_PORT || 8787);
+ const VERSION = '1.2.0';
+ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+@@ -114,6 +122,14 @@ const MODELS = {
+ const MAX_BODY = 8 * 1024;
+ const SPECIALISTS = ['researcher', 'analyst', 'creator', 'critic'];
+ 
++/* ---------------- persistence guard (fail closed) ---------------- */
++const PGUARD = persistence.checkGuard(PCFG, { readonly: READONLY });
++if (!PGUARD.ok) {
++  console.error(`REFUSING TO START (persistence guard): ${PGUARD.errors.join('; ')}.\n` +
++    'Fix the disk mount / COS_DB_PATH / COS_PERSISTENT_ROOT, or unset COS_REQUIRE_PERSISTENT for local development.');
++  process.exit(3);
++}
++
+ /* ---------------- auth ---------------- */
+ const sha = s => crypto.createHash('sha256').update(String(s)).digest();
+ const tokens = []; // { name, hash }
+@@ -157,8 +173,14 @@ function initDbIfRequested() {
+   if (READONLY) return 'COS_INIT_DB ignored: COS_READONLY=1';
+   if (!fs.existsSync(SCHEMA_PATH)) return `COS_INIT_DB set but schema file not found: ${SCHEMA_PATH}`;
+   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+-  const db = new DatabaseSync(DB_PATH);
++  // Build beside the target then rename: a crash mid-init leaves only a stray temp file, never a
++  // half-created cos.db that every later boot would treat as "already exists".
++  const tmpPath = `${DB_PATH}.init-${process.pid}`;
++  try { fs.rmSync(tmpPath, { force: true }); } catch {}
++  const db = new DatabaseSync(tmpPath);
+   try { db.exec(fs.readFileSync(SCHEMA_PATH, 'utf8')); } finally { db.close(); }
++  if (fs.existsSync(DB_PATH)) { fs.rmSync(tmpPath, { force: true }); return null; }
++  fs.renameSync(tmpPath, DB_PATH);
+   return `created EMPTY database from ${path.basename(SCHEMA_PATH)}`;
+ }
+ 
+@@ -166,7 +188,7 @@ function open(write) {
+   if (write && READONLY) throw Object.assign(new Error('Backend is in read-only (evidence) mode'), { status: 403 });
+   if (!fs.existsSync(DB_PATH)) throw Object.assign(new Error('Database file not found'), { status: 503 });
+   const db = new DatabaseSync(DB_PATH);
+-  db.exec('PRAGMA busy_timeout = 5000;');
++  db.exec(`PRAGMA busy_timeout = ${persistence.BUSY_TIMEOUT_MS};`);
+   if (READONLY) db.exec('PRAGMA query_only = ON;');
+   if (write) {
+     db.exec(`CREATE TABLE IF NOT EXISTS backend_events (
+@@ -373,10 +395,19 @@ function serveDashboard(req, res) {
+   res.end(req.method === 'HEAD' ? undefined : buf);
+ }
+ function health(req, res) {
+-  let present = fs.existsSync(DB_PATH), readable = false, guards = null;
+-  if (present) { let db; try { db = new DatabaseSync(DB_PATH); db.prepare('SELECT 1 FROM decisions LIMIT 1').get(); readable = true; guards = guardStatus(db); } catch {} finally { try { db && db.close(); } catch {} } }
++  let present = fs.existsSync(DB_PATH), readable = false, guards = null, journalMode = null, userVersion = null;
++  if (present) { let db; try { db = new DatabaseSync(DB_PATH); db.prepare('SELECT 1 FROM decisions LIMIT 1').get(); readable = true; guards = guardStatus(db);
++    journalMode = String(Object.values(db.prepare('PRAGMA journal_mode').get())[0]).toLowerCase();
++    userVersion = Number(Object.values(db.prepare('PRAGMA user_version').get())[0]); } catch {} finally { try { db && db.close(); } catch {} } }
++  // Persistence evidence. No secrets, tokens, keys or DB contents; just where the bytes live.
++  const p = persistence.inspect(PCFG);
++  const persistenceBlock = { ...p,
++    guard: !p.require_persistent ? 'not_required' : PGUARD.ok ? 'pass' : 'fail',
++    using_persistent_location: p.require_persistent ? p.db_path_inside_root === true : null };
+   const body = JSON.stringify({ ok: true, service: 'chief-of-staff-backend', version: VERSION, mode: MODE, read_only: READONLY,
+-    db: { present, readable, guards }, init: { enabled: INIT_DB, result: INIT_RESULT }, time: nowISO() });
++    db: { present, readable, guards, journal_mode: journalMode, busy_timeout_ms: persistence.BUSY_TIMEOUT_MS,
++      schema: { user_version: userVersion, expected: SCHEMA_VERSION, ok: userVersion === SCHEMA_VERSION, migration: MIGRATION_SUMMARY } },
++    persistence: persistenceBlock, init: { enabled: INIT_DB, result: INIT_RESULT }, shutting_down: shuttingDown, time: nowISO() });
+   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', ...SEC });
+   res.end(req.method === 'HEAD' ? undefined : body);
+ }
+@@ -395,7 +426,11 @@ function readBody(req) {
+   });
+ }
+ 
++let shuttingDown = false;
++let inflight = 0;
+ const server = http.createServer(async (req, res) => {
++  if (shuttingDown) { res.writeHead(503, { 'Content-Type': 'application/json', Connection: 'close', 'Retry-After': '5' }); return res.end(JSON.stringify({ ok: false, error: 'Server is shutting down; retry shortly' })); }
++  inflight++; res.on('close', () => { inflight--; });
+   cors(req, res);
+   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+   try {
+@@ -463,17 +498,33 @@ const server = http.createServer(async (req, res) => {
+ 
+ let initNote = null;
+ try { initNote = initDbIfRequested(); } catch (e) { initNote = 'DB init failed: ' + e.message; }
+-// Path-free summary for the public /health probe (the full note, with paths, stays in the console only).
+-let MIGRATION = { ok: null, applied: [], warnings: ['not run'] };
++// Summary for the public /health probe (counts only; the full detail stays in the console).
++let MIGRATION = { fatal: false, errors: [], report: null };
++let MIGRATION_SUMMARY = { ran: false };
+ if (!READONLY && fs.existsSync(DB_PATH)) {
+-  try { const d = new DatabaseSync(DB_PATH); try { MIGRATION = migrate(d); } finally { d.close(); } }
+-  catch (e) { MIGRATION = { ok: false, applied: [], warnings: [`migration failed: ${e.message}`] }; }
+-  console.log(`DB guards: ok=${MIGRATION.ok} applied=${MIGRATION.applied.length} warnings=${MIGRATION.warnings.length + (MIGRATION.skipped || []).length}`);
++  try {
++    const d = new DatabaseSync(DB_PATH);
++    try {
++      const mode = persistence.bootPragmas(d);
++      MIGRATION = migrateVersioned(d);
++      MIGRATION_SUMMARY = { ran: true, ok: !MIGRATION.fatal, version_before: MIGRATION.version_before, version_after: MIGRATION.version_after,
++        applied: MIGRATION.report ? MIGRATION.report.applied.length : 0, warnings: MIGRATION.errors.length + (MIGRATION.report ? MIGRATION.report.skipped.length : 0) };
++      console.log(`DB: journal_mode=${mode} busy_timeout=${persistence.BUSY_TIMEOUT_MS}ms user_version=${MIGRATION.version_after}/${SCHEMA_VERSION}`);
++    } finally { d.close(); }
++  } catch (e) { MIGRATION = { fatal: true, errors: [`migration failed: ${e.message}`], report: null }; }
++  if (MIGRATION.fatal) {
++    console.error(`REFUSING TO START (migration/schema check failed): ${MIGRATION.errors.join('; ')}.\nThe database was not modified beyond additive guards; nothing was reset or recreated.`);
++    process.exit(4);
++  }
++  console.log(`DB guards: applied=${MIGRATION.report.applied.length} warnings=${MIGRATION.report.warnings.length + MIGRATION.report.skipped.length}`);
++} else if (READONLY && fs.existsSync(DB_PATH)) {
++  try { const d = new DatabaseSync(DB_PATH); try { d.exec(`PRAGMA busy_timeout = ${persistence.BUSY_TIMEOUT_MS}`); } finally { d.close(); } } catch {}
+ }
+ const INIT_RESULT = !INIT_DB ? 'disabled' : initNote === null ? 'not_needed' : /^created/.test(initNote) ? 'created' : /ignored: COS_READONLY/.test(initNote) ? 'skipped' : 'failed';
+ 
+ server.listen(PORT, HOST, () => {
+   console.log(`Chief of Staff backend v${VERSION} on http://${HOST}:${PORT}  (mode=${MODE}${READONLY ? ', READ-ONLY' : ''})`);
++  console.log(`Persistence: require=${PCFG.requirePersistent} root=${PCFG.persistentRoot || '-'} guard=${PCFG.requirePersistent ? 'pass' : 'not_required'} (db path from ${PCFG.dbPathSource})`);
+   console.log(`DB: ${DB_PATH}${fs.existsSync(DB_PATH) ? '' : '   <-- NOT FOUND yet (set COS_INIT_DB=1 to create an empty one)'}`);
+   if (initNote) console.log(`DB init: ${initNote}`);
+   console.log(`Dashboard file: ${fs.existsSync(DASHBOARD_PATH) ? 'found' : 'NOT FOUND'}  |  health: GET /health`);
+@@ -482,4 +533,28 @@ server.listen(PORT, HOST, () => {
+     ? 'Listening beyond loopback; HTTPS is assumed to be terminated in front of this process (COS_TLS_TERMINATED=1).'
+     : 'WARNING: listening beyond loopback over plain HTTP — the token can be sniffed on shared networks. Put HTTPS in front of it (set COS_TLS_TERMINATED=1 once you have).');
+ });
+-for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { console.log(`${sig}: shutting down`); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 5000).unref(); });
++/* Graceful shutdown (Render redeploys send SIGTERM). Stop accepting work, let requests already
++ * running finish (each one closes its own SQLite connection in its finally block), then checkpoint
++ * the WAL and exit. Nothing is written on behalf of work that did not finish: a request cut off by the
++ * deadline is simply logged. No synthetic COMPLETED/FAILED rows, no gate involvement. */
++const GRACE_MS = Math.max(1000, Number(process.env.COS_SHUTDOWN_GRACE_MS) || 25000);
++function shutdown(sig) {
++  if (shuttingDown) return;
++  shuttingDown = true;
++  console.log(`${sig}: draining ${inflight} in-flight request(s), grace ${GRACE_MS}ms`);
++  server.close();
++  try { server.closeIdleConnections(); } catch {}
++  const started = Date.now();
++  const finish = () => {
++    const forced = inflight > 0;
++    if (forced) console.error(`SHUTDOWN: grace expired with ${inflight} request(s) still running; exiting without recording anything on their behalf`);
++    if (!READONLY && fs.existsSync(DB_PATH)) {
++      try { const d = new DatabaseSync(DB_PATH); try { d.exec(`PRAGMA busy_timeout = ${persistence.BUSY_TIMEOUT_MS}`); d.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } finally { d.close(); } }
++      catch (e) { console.error('SHUTDOWN: WAL checkpoint skipped: ' + e.message); }
++    }
++    console.log(`SHUTDOWN: ${forced ? 'forced' : 'clean'} after ${Date.now() - started}ms`);
++    process.exit(forced ? 1 : 0);
++  };
++  const t = setInterval(() => { try { server.closeIdleConnections(); } catch {} if (inflight === 0 || Date.now() - started >= GRACE_MS) { clearInterval(t); finish(); } }, 100);
++}
++for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => shutdown(sig));
+diff --git a/db_migrations.js b/db_migrations.js
+index 0b3dbc2..fdec9ce 100644
+--- a/db_migrations.js
++++ b/db_migrations.js
+@@ -41,4 +41,32 @@ function guardStatus(db) {
+   const missing = want.filter(([ty, n]) => !db.prepare(`SELECT 1 FROM sqlite_master WHERE type=? AND name=?`).get(ty, n)).map(x => x[1]);
+   return { ok: missing.length === 0, missing };
+ }
+-module.exports = { migrate, guardStatus, APPEND_ONLY };
++
++/* ---- Schema versioning (PRAGMA user_version) ----
++ * v0 = a DB that predates versioning (every DB created before this change, including production).
++ * v1 = base test17 schema + the append-only guards from migrate(). Stamping v0 -> v1 changes no data.
++ * A DB stamped NEWER than this code understands is refused (an older build must not run on a newer
++ * schema). A migration that throws, or that cannot create a required table/trigger, is FATAL.
++ * A legacy-duplicate execution_log index skip stays non-fatal (documented in Test 21D-7). */
++const SCHEMA_VERSION = 1;
++const CORE_TABLES = ['missions', 'decisions', 'execution_log', 'critic_reviews'];
++
++function migrateVersioned(db) {
++  const out = { schema_version: SCHEMA_VERSION, version_before: null, version_after: null, fatal: false, errors: [], report: null };
++  const getV = () => Number(Object.values(db.prepare('PRAGMA user_version').get())[0]);
++  try {
++    out.version_before = getV();
++    if (out.version_before > SCHEMA_VERSION) {
++      out.fatal = true; out.errors.push(`database schema version ${out.version_before} is newer than this build supports (${SCHEMA_VERSION}); refusing to run an older build on a newer schema`);
++      out.version_after = out.version_before; return out;
++    }
++    const missing = CORE_TABLES.filter(t => !db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(t));
++    if (missing.length) { out.fatal = true; out.errors.push(`core table(s) missing: ${missing.join(', ')}; refusing to run on an incompatible schema`); out.version_after = out.version_before; return out; }
++    out.report = migrate(db);
++    if (out.report.warnings.length) { out.fatal = true; out.errors.push(...out.report.warnings); }
++    if (!out.fatal && out.version_before < SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
++    out.version_after = getV();
++  } catch (e) { out.fatal = true; out.errors.push(`migration failed: ${e.message}`); }
++  return out;
++}
++module.exports = { migrate, guardStatus, APPEND_ONLY, SCHEMA_VERSION, CORE_TABLES, migrateVersioned };
+diff --git a/docker-entrypoint.js b/docker-entrypoint.js
+new file mode 100644
+index 0000000..838f992
+--- /dev/null
++++ b/docker-entrypoint.js
+@@ -0,0 +1,39 @@
++'use strict';
++/* Container entrypoint (no extra packages, no wrapper process: it becomes the server).
++ *
++ * Why: hosts such as Render mount a fresh persistent disk root-owned, while the app should not run as
++ * root. Nothing in the image build can fix that (the disk is not attached at build time), so it is done
++ * once at container start:
++ *   1. if started as root, chown ONLY the persistent directory itself (non-recursive) and the existing DB
++ *      files (cos.db, -wal, -shm, -journal) to the app user; symlinks are never followed or chowned;
++ *   2. drop to the app user (setgroups, setgid, setuid) and VERIFY the drop, or exit 1;
++ *   3. require the real server, which then runs unprivileged and still applies its own persistence guard.
++ * If already started as a non-root user (e.g. docker run --user), step 1-2 are skipped. */
++const fs = require('node:fs');
++const path = require('node:path');
++const { resolveConfig } = require('./persistence');
++
++const UID = Number(process.env.COS_RUN_UID || 1000), GID = Number(process.env.COS_RUN_GID || 1000);
++const die = m => { console.error(`ENTRYPOINT REFUSING TO START: ${m}`); process.exit(1); };
++
++if (typeof process.getuid === 'function' && process.getuid() === 0) {
++  if (!Number.isInteger(UID) || !Number.isInteger(GID) || UID <= 0 || GID <= 0) die(`COS_RUN_UID/COS_RUN_GID must be positive integers (got ${process.env.COS_RUN_UID}/${process.env.COS_RUN_GID}); refusing to keep running as root`);
++  const cfg = resolveConfig(process.env, __dirname);
++  const dir = path.dirname(cfg.dbPath);
++  const targets = [dir, ...['', '-wal', '-shm', '-journal'].map(x => cfg.dbPath + x)];
++  const changed = [];
++  if (dir === path.parse(dir).root) console.warn('ENTRYPOINT: DB directory is the filesystem root; not chowning anything');
++  else for (const t of targets) {
++    try {
++      const st = fs.lstatSync(t);
++      if (st.isSymbolicLink()) { console.warn(`ENTRYPOINT: not chowning symlink ${t}`); continue; }
++      if (st.uid !== UID || st.gid !== GID) { fs.chownSync(t, UID, GID); changed.push(t); }
++    } catch (e) { if (e.code !== 'ENOENT') console.warn(`ENTRYPOINT: could not chown ${t}: ${e.code || e.message}`); }
++  }
++  try { process.setgroups([]); process.setgid(GID); process.setuid(UID); }
++  catch (e) { die(`could not drop privileges to ${UID}:${GID}: ${e.message}`); }
++  if (process.getuid() !== UID || process.geteuid() !== UID || process.getgid() !== GID) die('privilege drop did not take effect');
++  try { process.setuid(0); die('privilege drop is reversible'); } catch { /* expected: cannot regain root */ }
++  console.log(`ENTRYPOINT: chowned ${changed.length} path(s) [${changed.join(', ') || 'none needed'}]; now running as uid=${process.getuid()} gid=${process.getgid()}`);
++}
++require('./cos_backend.js');
+diff --git a/package.json b/package.json
+index d94fb38..2c7b79f 100644
+--- a/package.json
++++ b/package.json
+@@ -6,7 +6,7 @@
+   "main": "cos_backend.js",
+   "scripts": {
+     "start": "node cos_backend.js",
+-    "test": "node test19b_tier_rules.js && node test19c_runanalyst_regression.js && node test19d_mission_failure.js && node test20_gate.js fixed && node test21_integration.js && node test22_grounding.js fixed"
++    "test": "node test19b_tier_rules.js && node test19c_runanalyst_regression.js && node test19d_mission_failure.js && node test20_gate.js fixed && node test21_integration.js && node test22_grounding.js fixed && node test23_persistence.js && node test24_entrypoint.js"
+   },
+   "engines": {
+     "node": ">=22.5.0"
+diff --git a/persistence.js b/persistence.js
+new file mode 100644
+index 0000000..206bb12
+--- /dev/null
++++ b/persistence.js
+@@ -0,0 +1,91 @@
++'use strict';
++/* Persistence configuration + production guard. Deployment-neutral: nothing here knows about Render.
++ *
++ *   COS_DB_PATH              SQLite file. Falls back to the legacy COS_DB, then ./cos.db beside the code.
++ *   COS_REQUIRE_PERSISTENT   1 = fail closed unless the DB provably lives under COS_PERSISTENT_ROOT.
++ *   COS_PERSISTENT_ROOT      directory the platform persists (e.g. /data on a Render Persistent Disk).
++ *
++ * The guard never asks "does the DB file exist?": a fresh persistent disk legitimately has none yet.
++ * It asks: is the path under the persistent root, does the root exist, can we write beside the DB.
++ * Symlinks are resolved so /data/cos.db -> /tmp/x cannot pass. */
++const fs = require('node:fs');
++const path = require('node:path');
++
++function resolveConfig(env, baseDir) {
++  const raw = env.COS_DB_PATH || env.COS_DB || '';
++  const source = env.COS_DB_PATH ? 'COS_DB_PATH' : env.COS_DB ? 'COS_DB (legacy)' : 'default';
++  return {
++    dbPath: path.resolve(raw || path.join(baseDir, 'cos.db')),
++    dbPathSource: source,
++    requirePersistent: env.COS_REQUIRE_PERSISTENT === '1',
++    persistentRoot: env.COS_PERSISTENT_ROOT ? path.resolve(env.COS_PERSISTENT_ROOT) : null,
++  };
++}
++
++const isInside = (root, target) => {
++  const rel = path.relative(root, target);
++  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
++};
++const real = p => { try { return fs.realpathSync(p); } catch { return null; } };
++
++/* Read-only facts (no writes): used by /health and by the guard. */
++function inspect(cfg) {
++  const dir = path.dirname(cfg.dbPath);
++  const rootReal = cfg.persistentRoot ? real(cfg.persistentRoot) : null;
++  const dirReal = real(dir);
++  const fileExists = fs.existsSync(cfg.dbPath);
++  const fileReal = fileExists ? real(cfg.dbPath) : null;
++  // Where the DB bytes will physically live (follows symlinks on the file and on the directory).
++  const physical = fileReal || (dirReal ? path.join(dirReal, path.basename(cfg.dbPath)) : null);
++  let writable = false;
++  try { fs.accessSync(dir, fs.constants.W_OK); writable = true; } catch {}
++  let separateFs = null;
++  try { if (rootReal) separateFs = fs.statSync(rootReal).dev !== fs.statSync(path.parse(rootReal).root).dev; } catch {}
++  return {
++    db_path: cfg.dbPath,
++    db_path_source: cfg.dbPathSource,
++    require_persistent: cfg.requirePersistent,
++    persistent_root: cfg.persistentRoot,
++    persistent_root_exists: !!rootReal,
++    db_file_exists: fileExists,
++    db_dir_exists: !!dirReal,
++    db_dir_writable: writable,
++    // lexical AND physical (symlink-resolved) containment; null when no root is configured
++    db_path_inside_root: cfg.persistentRoot ? (isInside(cfg.persistentRoot, cfg.dbPath) && !!rootReal && !!physical && isInside(rootReal, physical)) : null,
++    // Evidence only (not enforced): a real mounted disk is normally a different filesystem from "/".
++    root_on_separate_filesystem: separateFs,
++    wal_sidecars: `${cfg.dbPath}-wal, ${cfg.dbPath}-shm (beside the DB file)`,
++  };
++}
++
++/* Boot guard. Returns { ok, errors[], info }. Performs one tiny write probe (boot only). */
++function checkGuard(cfg, { readonly = false } = {}) {
++  const info = inspect(cfg);
++  const errors = [];
++  if (!cfg.requirePersistent) return { ok: true, errors, info, required: false };
++  if (!cfg.persistentRoot) errors.push('COS_REQUIRE_PERSISTENT=1 but COS_PERSISTENT_ROOT is not set, so persistence cannot be verified');
++  else {
++    if (!info.persistent_root_exists) errors.push(`persistent root does not exist: ${cfg.persistentRoot} (is the disk attached and mounted there?)`);
++    else if (path.parse(real(cfg.persistentRoot)).root === real(cfg.persistentRoot)) errors.push('persistent root must not be the filesystem root');
++    if (!info.db_path_inside_root) errors.push(`database path ${cfg.dbPath} is outside the persistent root ${cfg.persistentRoot} (it would live on ephemeral storage)`);
++  }
++  if (!info.db_dir_exists) errors.push(`database directory does not exist: ${path.dirname(cfg.dbPath)}`);
++  else if (!readonly) {
++    const probe = path.join(path.dirname(cfg.dbPath), `.cos_write_probe_${process.pid}`);
++    try { fs.writeFileSync(probe, 'x'); fs.unlinkSync(probe); }
++    catch (e) { errors.push(`database directory is not writable: ${path.dirname(cfg.dbPath)} (${e.code || e.message})`); }
++  }
++  return { ok: errors.length === 0, errors, info, required: true };
++}
++
++const BUSY_TIMEOUT_MS = 5000;
++
++/* WAL is stored in the DB file header, so setting it once at boot is enough; every connection
++ * still gets a busy timeout. Evidence (read-only) mode never changes the journal mode. */
++function bootPragmas(db, { readonly = false } = {}) {
++  db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS};`);
++  if (!readonly) db.exec('PRAGMA journal_mode = WAL;');
++  return String(Object.values(db.prepare('PRAGMA journal_mode').get())[0]).toLowerCase();
++}
++
++module.exports = { resolveConfig, inspect, checkGuard, bootPragmas, BUSY_TIMEOUT_MS, isInside };
+diff --git a/render.example.yaml b/render.example.yaml
+new file mode 100644
+index 0000000..5dc8a2e
+--- /dev/null
++++ b/render.example.yaml
+@@ -0,0 +1,37 @@
++# REFERENCE / DOCUMENTATION ONLY. This file is NOT named render.yaml on purpose: it configures nothing by
++# existing in the repo, and it does NOT mean a disk is attached. The real service is configured in the Render
++# Dashboard (Disks page + Environment page), or by creating a Blueprint from this file yourself.
++# Required on the REAL service: a Persistent Disk mounted at /data, and these env vars:
++#   COS_DB_PATH=/data/cos.db  COS_PERSISTENT_ROOT=/data  COS_REQUIRE_PERSISTENT=1
++# Render Blueprint (reference). Persistent Disks require a paid instance type and pin the service to
++# ONE instance (no zero-downtime deploys). Only files under the disk mountPath survive redeploys.
++# Not applied to any real service: IMPLEMENTED / LIVE-VALIDATION PENDING.
++services:
++  - type: web
++    name: chief-of-staff
++    runtime: docker
++    plan: starter
++    healthCheckPath: /health
++    disk:
++      name: cos-data
++      mountPath: /data
++      sizeGB: 1
++    envVars:
++      - key: COS_DB_PATH
++        value: /data/cos.db
++      - key: COS_PERSISTENT_ROOT
++        value: /data
++      - key: COS_REQUIRE_PERSISTENT
++        value: "1"
++      - key: COS_HOST
++        value: 0.0.0.0
++      - key: COS_TLS_TERMINATED
++        value: "1"
++      - key: COS_MODE
++        value: LIVE
++      - key: COS_TOKEN
++        sync: false
++      - key: GEMINI_API_KEY
++        sync: false
++      - key: GROQ_API_KEY
++        sync: false
+diff --git a/test23_persistence.js b/test23_persistence.js
+new file mode 100644
+index 0000000..e0db9f1
+--- /dev/null
++++ b/test23_persistence.js
+@@ -0,0 +1,179 @@
++/**
++ * TEST 23 — persistence safety (LOCAL). Spawns the REAL cos_backend.js.
++ *
++ *   23A  persistence guard (COS_REQUIRE_PERSISTENT): refuses outside root / missing root / no root /
++ *        symlink escape / unwritable dir; accepts a fresh empty disk (no DB file yet)
++ *   23B  /health evidence, WAL, busy timeout, user_version, init + restart does not recreate/wipe
++ *   23C  write -> SIGTERM -> restart -> fresh read, and write -> SIGKILL -> restart -> fresh read
++ *   23D  migrations: unversioned (v0) DB stamped not wiped; newer version refused; missing core table
++ *        refused; legacy duplicate rows still non-fatal (Test 21D-7 contract); append-only triggers intact
++ *   23E  SIGTERM drains an in-flight request, refuses new ones, exits 0, writes no synthetic rows
++ *
++ * This proves the CODE against a local filesystem. It does NOT prove Render: only a real
++ * write -> redeploy -> fresh read on the deployed service does that.
++ */
++'use strict';
++const fs = require('fs'), os = require('os'), path = require('path'), http = require('http');
++const { spawn, spawnSync } = require('child_process');
++const { DatabaseSync } = require('node:sqlite');
++const persistence = require('./persistence');
++
++let passed = 0, failed = 0;
++const check = (n, ok, d) => { if (ok) { passed++; console.log(`PASS  ${n}`); } else { failed++; console.log(`FAIL  ${n}${d ? '  -> ' + d : ''}`); } };
++const skip = (n, why) => console.log(`SKIP  ${n}  (${why})`);
++const sleep = ms => new Promise(r => setTimeout(r, ms));
++const schema = fs.readFileSync(path.join(__dirname, 'test17_schema.sql'), 'utf8');
++const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 't23-'));
++const TOKEN = 't23-token-' + 'x'.repeat(26);
++const mk = n => { const d = path.join(tmp, n); fs.mkdirSync(d, { recursive: true }); return d; };
++const port = () => 20000 + Math.floor(Math.random() * 20000);
++const dec = (d, id, st, r) => d.prepare(`INSERT INTO decisions (mission_id,status,rationale,created_at) VALUES (?,?,?,?)`).run(id, st, r, 't');
++
++function req(P, method, p, body) {
++  return new Promise((resolve, reject) => {
++    const data = body ? JSON.stringify(body) : null;
++    const r = http.request({ host: '127.0.0.1', port: P, path: p, method, headers: { Authorization: 'Bearer ' + TOKEN, 'Content-Type': 'application/json', ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {}) } }, rs => {
++      let s = ''; rs.on('data', c => s += c); rs.on('end', () => { let j = null; try { j = JSON.parse(s); } catch {} resolve({ status: rs.statusCode, json: j, raw: s }); });
++    });
++    r.on('error', reject); if (data) r.write(data); r.end();
++  });
++}
++function boot(env, { preload } = {}) {
++  const P = port();
++  const args = preload ? ['--require', preload, path.join(__dirname, 'cos_backend.js')] : [path.join(__dirname, 'cos_backend.js')];
++  const child = spawn(process.execPath, args, { env: { PATH: process.env.PATH, COS_PORT: String(P), PORT: String(P), COS_HOST: '127.0.0.1', COS_TOKEN: TOKEN, COS_MODE: 'MOCK', ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
++  const b = { P, child, log: '', exited: null };
++  child.stdout.on('data', d => b.log += d); child.stderr.on('data', d => b.log += d);
++  b.done = new Promise(res => child.on('exit', (code, sig) => { b.exited = { code, sig }; res(b.exited); }));
++  b.up = async () => { for (let i = 0; i < 60 && !b.exited; i++) { try { if ((await req(P, 'GET', '/health')).status === 200) return true; } catch {} await sleep(150); } return false; };
++  return b;
++}
++const expectRefusal = async (env, code) => { const b = boot(env); const r = await Promise.race([b.done, sleep(6000).then(() => null)]); if (!r) b.child.kill('SIGKILL'); return { r, log: b.log, listening: /on http:/.test(b.log) }; };
++
++(async () => {
++  try {
++    // ---------------- 23A guard ----------------
++    { const root = mk('A1root'), cfg = persistence.resolveConfig({ COS_DB_PATH: path.join(root, 'cos.db'), COS_REQUIRE_PERSISTENT: '1', COS_PERSISTENT_ROOT: root }, __dirname);
++      const g = persistence.checkGuard(cfg);
++      check('23A-1 fresh empty persistent disk (no DB file yet) is accepted', g.ok && !g.info.db_file_exists, g.errors.join(';')); }
++    { const root = mk('A2root'), other = mk('A2other');
++      const g = persistence.checkGuard(persistence.resolveConfig({ COS_DB_PATH: path.join(other, 'cos.db'), COS_REQUIRE_PERSISTENT: '1', COS_PERSISTENT_ROOT: root }, __dirname));
++      check('23A-2 DB path outside the persistent root is refused', !g.ok && /outside the persistent root/.test(g.errors.join()), g.errors.join(';')); }
++    { const g = persistence.checkGuard(persistence.resolveConfig({ COS_DB_PATH: path.join(tmp, 'nope', 'cos.db'), COS_REQUIRE_PERSISTENT: '1', COS_PERSISTENT_ROOT: path.join(tmp, 'nope') }, __dirname));
++      check('23A-3 persistent root that does not exist is refused', !g.ok && /does not exist/.test(g.errors.join()), g.errors.join(';')); }
++    { const root = mk('A4root'), g = persistence.checkGuard(persistence.resolveConfig({ COS_DB_PATH: path.join(root, 'cos.db'), COS_REQUIRE_PERSISTENT: '1' }, __dirname));
++      check('23A-4 REQUIRE=1 without a persistent root is refused (cannot verify)', !g.ok && /COS_PERSISTENT_ROOT is not set/.test(g.errors.join())); }
++    { const root = mk('A5root'), out = mk('A5out'); fs.writeFileSync(path.join(out, 'real.db'), ''); fs.symlinkSync(path.join(out, 'real.db'), path.join(root, 'cos.db'));
++      const g = persistence.checkGuard(persistence.resolveConfig({ COS_DB_PATH: path.join(root, 'cos.db'), COS_REQUIRE_PERSISTENT: '1', COS_PERSISTENT_ROOT: root }, __dirname));
++      check('23A-5 symlink inside the root pointing outside it is refused', !g.ok, JSON.stringify(g.info.db_path_inside_root)); }
++    { const root = mk('A6root'), g = persistence.checkGuard(persistence.resolveConfig({ COS_DB_PATH: path.join(root, '..', 'A6root-sibling', 'cos.db'), COS_REQUIRE_PERSISTENT: '1', COS_PERSISTENT_ROOT: root }, __dirname));
++      check('23A-6 ".." traversal and sibling-prefix paths are refused', !g.ok); }
++    { const g = persistence.checkGuard(persistence.resolveConfig({ COS_DB_PATH: '/cos.db', COS_REQUIRE_PERSISTENT: '1', COS_PERSISTENT_ROOT: '/' }, __dirname));
++      check('23A-7 filesystem root "/" is not an acceptable persistent root', !g.ok); }
++    { const cfg = persistence.resolveConfig({}, __dirname);
++      check('23A-8 no variables: local default ./cos.db, absolute, guard not required', path.isAbsolute(cfg.dbPath) && cfg.dbPath.endsWith('cos.db') && persistence.checkGuard(cfg).ok && !cfg.requirePersistent); }
++    { const cfg = persistence.resolveConfig({ COS_DB: 'rel/legacy.db' }, __dirname);
++      check('23A-9 legacy COS_DB still honoured, resolved absolute', path.isAbsolute(cfg.dbPath) && cfg.dbPathSource === 'COS_DB (legacy)'); }
++    if (process.getuid && process.getuid() === 0) {
++      const root = mk('A10root'); fs.chmodSync(root, 0o555); fs.chmodSync(tmp, 0o755);
++      const code = `process.setuid(65534);const p=require(${JSON.stringify(path.join(__dirname, 'persistence.js'))});const g=p.checkGuard(p.resolveConfig({COS_DB_PATH:${JSON.stringify(path.join(root, 'cos.db'))},COS_REQUIRE_PERSISTENT:'1',COS_PERSISTENT_ROOT:${JSON.stringify(root)}},'/'));console.log(JSON.stringify({ok:g.ok,e:g.errors}))`;
++      const r = spawnSync(process.execPath, ['-e', code], { encoding: 'utf8' });
++      let j = null; try { j = JSON.parse(r.stdout); } catch {}
++      if (j) check('23A-10 unwritable DB directory is refused (run as an unprivileged user)', j.ok === false && /not writable/.test(j.e.join()), r.stdout + r.stderr);
++      else skip('23A-10 unwritable DB directory', 'could not drop privileges here: ' + (r.stderr || '').slice(0, 120));
++    } else {
++      const root = mk('A10root'); fs.chmodSync(root, 0o555);
++      const g = persistence.checkGuard(persistence.resolveConfig({ COS_DB_PATH: path.join(root, 'cos.db'), COS_REQUIRE_PERSISTENT: '1', COS_PERSISTENT_ROOT: root }, __dirname));
++      check('23A-10 unwritable DB directory is refused', !g.ok && /not writable/.test(g.errors.join())); fs.chmodSync(root, 0o755);
++    }
++    // the real process: refuses and never listens
++    { const root = mk('A11root'), other = mk('A11other');
++      const x = await expectRefusal({ COS_DB_PATH: path.join(other, 'cos.db'), COS_REQUIRE_PERSISTENT: '1', COS_PERSISTENT_ROOT: root, COS_INIT_DB: '1' });
++      check('23A-11 real server: DB outside root -> exits 3, never listens, creates no DB file', x.r && x.r.code === 3 && !x.listening && !fs.existsSync(path.join(other, 'cos.db')) && /persistence guard/.test(x.log), JSON.stringify(x.r) + x.log.slice(-200)); }
++    { const x = await expectRefusal({ COS_DB_PATH: path.join(tmp, 'gone', 'cos.db'), COS_REQUIRE_PERSISTENT: '1', COS_PERSISTENT_ROOT: path.join(tmp, 'gone'), COS_INIT_DB: '1' });
++      check('23A-12 real server: missing root -> exits 3, directory is NOT auto-created', x.r && x.r.code === 3 && !fs.existsSync(path.join(tmp, 'gone')), JSON.stringify(x.r)); }
++
++    // ---------------- 23B/23C lifecycle on a "persistent disk" ----------------
++    const disk = mk('disk'), dbp = path.join(disk, 'cos.db');
++    const penv = { COS_DB_PATH: dbp, COS_PERSISTENT_ROOT: disk, COS_REQUIRE_PERSISTENT: '1', COS_INIT_DB: '1' };
++    const MARK = 'PERSISTENCE_ACCEPTANCE_LOCAL_' + Date.now();
++    let b = boot(penv);
++    check('23B-1 boots on an empty persistent disk and creates the DB under the root', await b.up() && fs.existsSync(dbp), b.log.slice(-300));
++    let h = (await req(b.P, 'GET', '/health')).json;
++    check('23B-2 /health: resolved path, root, REQUIRE, guard pass, inside root, dir writable', h.persistence.db_path === dbp && h.persistence.persistent_root === disk && h.persistence.require_persistent === true && h.persistence.guard === 'pass' && h.persistence.db_path_inside_root === true && h.persistence.db_dir_writable === true && h.persistence.db_file_exists === true && h.persistence.using_persistent_location === true, JSON.stringify(h.persistence));
++    check('23B-3 /health: db.guards ok, journal_mode=wal, busy_timeout reported', h.db.guards.ok === true && h.db.journal_mode === 'wal' && h.db.busy_timeout_ms === 5000, JSON.stringify(h.db));
++    check('23B-4 /health: schema user_version == expected (1) and migration summary present', h.db.schema.user_version === 1 && h.db.schema.expected === 1 && h.db.schema.ok === true && h.db.schema.migration.ran === true, JSON.stringify(h.db.schema));
++    check('23B-5 /health exposes no token or key material', !h.persistence || !JSON.stringify(h).includes(TOKEN) && !/api[_-]?key/i.test(JSON.stringify(h)));
++    check('23B-6 init result is created on first boot', h.init.result === 'created', h.init.result);
++
++    // seed two awaiting-approval missions, then exercise the REAL approval path
++    { const d = new DatabaseSync(dbp); d.exec('PRAGMA busy_timeout=5000');
++      for (const id of ['M_ONE', 'M_TWO']) { d.prepare(`INSERT INTO missions (id,request_text,risk_tier,created_at) VALUES (?,?, 'high','t')`).run(id, `${MARK} ${id}`); dec(d, id, 'PROPOSED', `${MARK} proposed`); dec(d, id, 'AWAITING_APPROVAL', `${MARK} halt`); }
++      d.close(); }
++    const a1 = await req(b.P, 'POST', '/api/missions/M_ONE/decision', { decision: 'APPROVED' });
++    check('23C-1 approval through the normal path: 200', a1.status === 200, a1.raw.slice(0, 200));
++    let s1 = (await req(b.P, 'GET', '/api/snapshot')).json;
++    const countAudit = (s, id) => (s.audit || []).filter(a => a.mission_id === id).length;
++    check('23C-2 before restart: mission, marker and audit rows present', s1.missions.some(m => m.id === 'M_ONE') && JSON.stringify(s1).includes(MARK) && countAudit(s1, 'M_ONE') >= 2, `audit=${countAudit(s1, 'M_ONE')}`);
++    const rows1 = new DatabaseSync(dbp).prepare(`SELECT status FROM decisions WHERE mission_id='M_ONE' ORDER BY id`).all().map(r => r.status).join(',');
++
++    b.child.kill('SIGTERM'); const ex1 = await b.done;
++    check('23C-3 SIGTERM: clean exit code 0 and "clean" shutdown logged', ex1.code === 0 && /SHUTDOWN: clean/.test(b.log), JSON.stringify(ex1) + b.log.slice(-200));
++    { const stray = []; const walk = d => { for (const f of fs.readdirSync(d, { withFileTypes: true })) { const fp = path.join(d, f.name); if (f.isDirectory()) walk(fp); else if (/-(wal|shm)$/.test(f.name)) stray.push(fp); } }; walk(tmp);
++      check('23C-4 after a clean stop any -wal/-shm file is beside the DB on the disk (none elsewhere)', stray.every(f => path.dirname(f) === disk), stray.join(',')); }
++    b = boot(penv); check('23C-5 restart on the same disk with COS_INIT_DB=1 boots', await b.up(), b.log.slice(-300));
++    h = (await req(b.P, 'GET', '/health')).json;
++    check('23C-6 after restart: init not_needed (existing DB untouched), guard pass, journal wal, version 1', h.init.result === 'not_needed' && h.persistence.guard === 'pass' && h.db.journal_mode === 'wal' && h.db.schema.user_version === 1 && h.db.guards.ok, JSON.stringify({ i: h.init, g: h.persistence.guard, d: h.db.schema }));
++    let s2 = (await req(b.P, 'GET', '/api/snapshot')).json;
++    const rows2 = new DatabaseSync(dbp).prepare(`SELECT status FROM decisions WHERE mission_id='M_ONE' ORDER BY id`).all().map(r => r.status).join(',');
++    check('23C-7 FRESH READ after SIGTERM restart: same mission, marker, decisions, audit', s2.missions.some(m => m.id === 'M_ONE') && JSON.stringify(s2).includes(MARK) && rows2 === rows1 && countAudit(s2, 'M_ONE') === countAudit(s1, 'M_ONE'), `${rows1} | ${rows2}`);
++    const a2 = await req(b.P, 'POST', '/api/missions/M_TWO/decision', { decision: 'APPROVED' });
++    b.child.kill('SIGKILL'); await b.done;     // hard kill right after a committed write (no graceful path)
++    b = boot(penv); await b.up();
++    const s3 = (await req(b.P, 'GET', '/api/snapshot')).json;
++    const v3 = new DatabaseSync(dbp);
++    check('23C-8 FRESH READ after SIGKILL restart: both committed approvals + executions survive', a2.status === 200 && ['M_ONE', 'M_TWO'].every(id => v3.prepare(`SELECT COUNT(*) c FROM execution_log WHERE mission_id=?`).get(id).c === 1) && s3.missions.some(m => m.id === 'M_TWO') && s3.health.audit === 'ok', `a2=${a2.status}`);
++    check('23C-9 integrity_check ok and audit rows still append-only after restarts', Object.values(v3.prepare('PRAGMA integrity_check').get())[0] === 'ok' && (() => { try { v3.prepare(`UPDATE decisions SET rationale='forged'`).run(); return false; } catch (e) { return /append-only/.test(e.message); } })());
++    v3.close(); b.child.kill('SIGTERM'); await b.done;
++
++    // ---------------- 23D migrations ----------------
++    { const dp = path.join(mk('D1'), 'v0.db'); const d = new DatabaseSync(dp); d.exec(schema);   // pre-versioning DB: user_version 0, no guards
++      d.prepare(`INSERT INTO missions (id,request_text,created_at) VALUES ('OLD','legacy','t')`).run(); dec(d, 'OLD', 'PROPOSED', 'legacy row'); d.close();
++      const before = JSON.stringify(new DatabaseSync(dp).prepare('SELECT * FROM decisions').all());
++      let bb = boot({ COS_DB_PATH: dp, COS_INIT_DB: '0' }); const up = await bb.up(); const hh = up ? (await req(bb.P, 'GET', '/health')).json : null;
++      bb.child.kill('SIGTERM'); await bb.done;
++      const v = new DatabaseSync(dp);
++      check('23D-1 unversioned existing DB: boots, stamped v0 -> v1, existing rows byte-identical, guards applied', up && hh.db.schema.user_version === 1 && hh.db.guards.ok && JSON.stringify(v.prepare('SELECT * FROM decisions').all()) === before, bb.log.slice(-300));
++      bb = boot({ COS_DB_PATH: dp, COS_INIT_DB: '0' }); await bb.up(); const h2 = (await req(bb.P, 'GET', '/health')).json; bb.child.kill('SIGTERM'); await bb.done;
++      check('23D-2 second boot is idempotent: nothing applied, version stays 1', h2.db.schema.migration.applied === 0 && h2.db.schema.migration.version_before === 1 && h2.db.schema.user_version === 1, JSON.stringify(h2.db.schema.migration)); v.close(); }
++    { const dp = path.join(mk('D2'), 'new.db'); const d = new DatabaseSync(dp); d.exec(schema); d.exec('PRAGMA user_version = 99'); d.close();
++      const x = await expectRefusal({ COS_DB_PATH: dp, COS_INIT_DB: '0' });
++      check('23D-3 DB stamped with a NEWER schema version: refuses to boot (exit 4), data untouched', x.r && x.r.code === 4 && !x.listening && /newer than this build/.test(x.log) && Number(Object.values(new DatabaseSync(dp).prepare('PRAGMA user_version').get())[0]) === 99, JSON.stringify(x.r) + x.log.slice(-200)); }
++    { const dp = path.join(mk('D3'), 'broken.db'); const d = new DatabaseSync(dp); d.exec('CREATE TABLE missions (id TEXT PRIMARY KEY)'); d.close();
++      const x = await expectRefusal({ COS_DB_PATH: dp, COS_INIT_DB: '0' });
++      check('23D-4 DB missing core tables: refuses to boot (exit 4), does not recreate or reset it', x.r && x.r.code === 4 && !x.listening && /core table/.test(x.log) && new DatabaseSync(dp).prepare(`SELECT COUNT(*) c FROM sqlite_master WHERE type='table'`).get().c === 1, JSON.stringify(x.r) + x.log.slice(-200)); }
++    { const dp = path.join(mk('D4'), 'dup.db'); const d = new DatabaseSync(dp); d.exec(schema); d.prepare(`INSERT INTO missions (id,request_text,created_at) VALUES ('M','x','t')`).run();
++      for (const s of ['a', 'b']) d.prepare(`INSERT INTO execution_log (mission_id,detail,created_at) VALUES ('M',?,'t')`).run(s); d.close();
++      const bb = boot({ COS_DB_PATH: dp, COS_INIT_DB: '0' }); const up = await bb.up(); const hh = up ? (await req(bb.P, 'GET', '/health')).json : null; bb.child.kill('SIGTERM'); await bb.done;
++      check('23D-5 legacy duplicate execution rows stay NON-fatal (Test 21D-7 contract) but are surfaced', up && hh.db.guards.ok === false && hh.db.schema.migration.warnings >= 1, bb.log.slice(-300)); }
++
++    // ---------------- 23E drain on SIGTERM ----------------
++    { const stub = path.join(tmp, 'slow_stub.js');
++      fs.writeFileSync(stub, `global.fetch=async(url)=>{const u=String(url);if(u.startsWith('https://generativelanguage.googleapis.com/')){await new Promise(r=>setTimeout(r,1500));return{ok:false,status:503,json:async()=>({}),text:async()=>'stub 503'};}const b='seed';return{ok:true,status:200,json:async()=>({}),text:async()=>b,arrayBuffer:async()=>Buffer.from(b),headers:{get:()=>'text/plain'}};};`);
++      const dp = path.join(mk('E'), 'cos.db');
++      const bb = boot({ COS_DB_PATH: dp, COS_INIT_DB: '1', COS_MODE: 'LIVE', GEMINI_API_KEY: 'test-key-not-real' }, { preload: stub });
++      check('23E-1 backend (slow stubbed provider) started', await bb.up(), bb.log.slice(-200));
++      const inflight = req(bb.P, 'POST', '/api/missions', { objective: 'Shutdown drain regression request', nonce: 'DRAIN23_NONCE_01' }).catch(e => ({ status: 'reset', json: null, raw: String(e && e.message) }));
++      await sleep(400); bb.child.kill('SIGTERM'); await sleep(250);
++      let late = null; try { late = await req(bb.P, 'GET', '/health'); } catch (e) { late = { status: 'refused' }; }
++      const r = await inflight; const ex = await bb.done;
++      check('23E-2 request already running when SIGTERM arrived completes normally (502 + mission_id)', r.status === 502 && r.json && typeof r.json.mission_id === 'string', `${r.status} ${r.raw.slice(0, 120)}`);
++      check('23E-3 a NEW request after SIGTERM is refused (503 or connection refused)', late.status === 503 || late.status === 'refused', String(late.status));
++      check('23E-4 process exits 0 with a clean shutdown after the drain', ex.code === 0 && /SHUTDOWN: clean/.test(bb.log), JSON.stringify(ex) + bb.log.slice(-200));
++      const v = new DatabaseSync(dp);
++      const st = v.prepare(`SELECT status FROM decisions WHERE mission_id=? ORDER BY id`).all((r.json && r.json.mission_id) || '').map(x => x.status);
++      check('23E-5 the drained request left its own truthful FAILED row; no COMPLETED/APPROVED/EXECUTED fabricated', st.includes('FAILED') && !st.some(x => /COMPLETED|APPROVED|EXECUTED/.test(x)) && v.prepare('SELECT COUNT(*) c FROM execution_log').get().c === 0, st.join(',')); v.close(); }
++  } catch (e) { check('test run completed without exception', false, e && e.stack); }
++  console.log(`\nTEST23 result=${failed === 0 ? 'PASS' : 'FAIL'} passed=${passed} failed=${failed}`);
++  process.exit(failed === 0 ? 0 : 1);
++})();
+diff --git a/test24_entrypoint.js b/test24_entrypoint.js
+new file mode 100644
+index 0000000..c887a33
+--- /dev/null
++++ b/test24_entrypoint.js
+@@ -0,0 +1,110 @@
++/**
++ * TEST 24 — container entrypoint + Dockerfile readiness (LOCAL, no Docker needed).
++ *
++ *   24A  static: Dockerfile ships persistence.js + docker-entrypoint.js, starts via the entrypoint, does NOT bake
++ *        COS_REQUIRE_PERSISTENT into the image, does not pin USER root, and the example Blueprint is not named render.yaml
++ *   24B  behaviour (needs to run as root, otherwise SKIPPED): simulate a host that mounts a fresh disk ROOT-OWNED
++ *        - control: the unprivileged server alone cannot use it (guard refuses: not writable)
++ *        - entrypoint: chowns the dir, drops to uid 1000, boots, guard passes, DB created and owned by 1000
++ *        - an existing root-owned DB (from an earlier root deployment) is re-owned, data intact
++ *        - already-unprivileged start (docker run --user) works with no chown
++ *        - invalid COS_RUN_UID refuses to start instead of running as root
++ *        - a symlinked DB path is never chowned
++ *
++ * This is NOT a Docker build and NOT Render. It proves the ownership logic against a simulated root-owned mount.
++ */
++'use strict';
++const fs = require('fs'), os = require('os'), path = require('path'), http = require('http');
++const { spawn } = require('child_process');
++const { DatabaseSync } = require('node:sqlite');
++
++let passed = 0, failed = 0;
++const check = (n, ok, d) => { if (ok) { passed++; console.log(`PASS  ${n}`); } else { failed++; console.log(`FAIL  ${n}${d ? '  -> ' + d : ''}`); } };
++const sleep = ms => new Promise(r => setTimeout(r, ms));
++const df = f => fs.readFileSync(path.join(__dirname, f), 'utf8');
++
++// ---------------- 24A static ----------------
++const docker = df('Dockerfile');
++const dockerCode = docker.split('\n').filter(l => !l.trim().startsWith('#')).join('\n');
++check('24A-1 Dockerfile COPYs persistence.js and docker-entrypoint.js', /COPY[^\n]*persistence\.js/.test(dockerCode) && /COPY[^\n]*docker-entrypoint\.js/.test(dockerCode));
++check('24A-2 Dockerfile starts through the entrypoint', /CMD \["node", "docker-entrypoint\.js"\]/.test(dockerCode));
++check('24A-3 COS_REQUIRE_PERSISTENT is NOT baked into the image (deployment decides)', !/COS_REQUIRE_PERSISTENT/.test(dockerCode));
++check('24A-4 image does not pin the whole container to USER root or a RUN_AS toggle', !/^\s*USER\s/m.test(dockerCode) && !/RUN_AS/.test(dockerCode));
++check('24A-5 Blueprint example is not named render.yaml (cannot imply a configured disk)', !fs.existsSync(path.join(__dirname, 'render.yaml')) && fs.existsSync(path.join(__dirname, 'render.example.yaml')) && /DOCUMENTATION ONLY/.test(df('render.example.yaml')));
++
++const isRoot = process.getuid && process.getuid() === 0;
++if (!isRoot) {
++  console.log('SKIP  24B behavioural checks (need root to simulate a root-owned mount and drop privileges)');
++  console.log(`\nTEST24 result=${failed === 0 ? 'PASS' : 'FAIL'} passed=${passed} failed=${failed} (24B skipped)`);
++  process.exit(failed === 0 ? 0 : 1);
++}
++
++// ---------------- 24B behaviour ----------------
++const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 't24-')); fs.chmodSync(tmp, 0o755);
++const TOKEN = 't24-token-' + 'x'.repeat(26);
++const port = () => 20000 + Math.floor(Math.random() * 20000);
++const mkdisk = n => { const d = path.join(tmp, n); fs.mkdirSync(d); fs.chownSync(d, 0, 0); fs.chmodSync(d, 0o755); return d; };   // root-owned 0755, like a fresh mount
++const owner = p => { const s = fs.lstatSync(p); return `${s.uid}:${s.gid}`; };
++function get(P, p) { return new Promise((res, rej) => { http.get({ host: '127.0.0.1', port: P, path: p }, rs => { let s = ''; rs.on('data', c => s += c); rs.on('end', () => { try { res(JSON.parse(s)); } catch { res(null); } }); }).on('error', rej); }); }
++function start(argv, env, { asUser } = {}) {
++  const P = port();
++  const base = asUser ? ['setpriv', ['--reuid=' + asUser, '--regid=' + asUser, '--clear-groups', process.execPath, ...argv]] : [process.execPath, argv];
++  const child = spawn(base[0], base[1], { env: { PATH: process.env.PATH, COS_PORT: String(P), PORT: String(P), COS_HOST: '127.0.0.1', COS_TOKEN: TOKEN, COS_MODE: 'MOCK', ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
++  const b = { P, child, log: '', exited: null };
++  child.stdout.on('data', d => b.log += d); child.stderr.on('data', d => b.log += d);
++  b.done = new Promise(r => child.on('exit', (code, sig) => { b.exited = { code, sig }; r(b.exited); }));
++  b.up = async () => { for (let i = 0; i < 60 && !b.exited; i++) { try { if (await get(P, '/health')) return true; } catch {} await sleep(150); } return false; };
++  b.uid = () => { try { return /^Uid:\s+(\d+)/m.exec(fs.readFileSync(`/proc/${child.pid}/status`, 'utf8'))[1]; } catch { return null; } };
++  return b;
++}
++const stop = async b => { b.child.kill('SIGTERM'); await Promise.race([b.done, sleep(5000)]); b.child.kill('SIGKILL'); };
++const ENTRY = [path.join(__dirname, 'docker-entrypoint.js')], SERVER = [path.join(__dirname, 'cos_backend.js')];
++const penv = disk => ({ COS_DB_PATH: path.join(disk, 'cos.db'), COS_PERSISTENT_ROOT: disk, COS_REQUIRE_PERSISTENT: '1', COS_INIT_DB: '1' });
++
++(async () => {
++  try {
++    // control: the problem
++    { const disk = mkdisk('ctl'); const b = start(SERVER, penv(disk), { asUser: 1000 }); const r = await Promise.race([b.done, sleep(6000).then(() => null)]); if (!r) b.child.kill('SIGKILL');
++      check('24B-1 CONTROL: unprivileged server on a root-owned disk refuses to boot (not writable), no DB created', r && r.code === 3 && /not writable/.test(b.log) && !fs.existsSync(path.join(disk, 'cos.db')), JSON.stringify(r) + b.log.slice(-200)); }
++
++    // the fix
++    { const disk = mkdisk('fix'); check('24B-2 precondition: simulated disk is root-owned', owner(disk) === '0:0');
++      const b = start(ENTRY, penv(disk)); const up = await b.up(); const h = up ? await get(b.P, '/health') : null;
++      check('24B-3 entrypoint on the same root-owned disk: boots', up, b.log.slice(-300));
++      check('24B-4 process runs as uid 1000, not root', b.uid() === '1000', 'uid=' + b.uid());
++      check('24B-5 /health: guard pass, inside root, dir writable, db created', h && h.persistence.guard === 'pass' && h.persistence.db_path_inside_root === true && h.persistence.db_dir_writable === true && h.persistence.db_file_exists === true, h && JSON.stringify(h.persistence));
++      check('24B-6 persistent dir and DB are owned by 1000:1000 (only these were chowned)', owner(disk) === '1000:1000' && owner(path.join(disk, 'cos.db')) === '1000:1000' && /chowned 1 path\(s\)/.test(b.log), owner(disk) + ' | ' + b.log.slice(0, 200));
++      check('24B-7 entrypoint log states the privilege drop', /now running as uid=1000 gid=1000/.test(b.log));
++      await stop(b);
++      const b2 = start(ENTRY, penv(disk)); const up2 = await b2.up(); const h2 = up2 ? await get(b2.P, '/health') : null;
++      check('24B-8 second start (disk now owned by 1000): boots, init not_needed, nothing re-chowned', up2 && h2.init.result === 'not_needed' && /chowned 0 path\(s\)/.test(b2.log), b2.log.slice(0, 250)); await stop(b2); }
++
++    // earlier root deployment left a root-owned DB
++    { const disk = mkdisk('legacy'); const dbp = path.join(disk, 'cos.db');
++      const schema = fs.readFileSync(path.join(__dirname, 'test17_schema.sql'), 'utf8'); const d = new DatabaseSync(dbp); d.exec(schema);
++      d.prepare(`INSERT INTO missions (id,request_text,created_at) VALUES ('ROOTMADE','keep me','t')`).run(); d.close();
++      check('24B-9 precondition: existing DB is root-owned', owner(dbp) === '0:0');
++      const b = start(ENTRY, penv(disk)); const up = await b.up(); await stop(b);
++      const v = new DatabaseSync(dbp);
++      check('24B-10 existing root-owned DB is re-owned to 1000 and its data is intact', up && owner(dbp) === '1000:1000' && v.prepare(`SELECT request_text t FROM missions WHERE id='ROOTMADE'`).get().t === 'keep me', b.log.slice(0, 250)); v.close(); }
++
++    // already unprivileged
++    { const disk = mkdisk('nonroot'); fs.chownSync(disk, 1000, 1000);
++      const b = start(ENTRY, penv(disk), { asUser: 1000 }); const up = await b.up();
++      check('24B-11 started already as uid 1000 on a writable disk (docker run --user): boots, no chown attempted', up && b.uid() === '1000' && !/ENTRYPOINT/.test(b.log), b.log.slice(0, 250)); await stop(b); }
++
++    // fail closed
++    { const disk = mkdisk('bad'); const b = start(ENTRY, { ...penv(disk), COS_RUN_UID: 'abc' }); const r = await Promise.race([b.done, sleep(6000).then(() => null)]); if (!r) b.child.kill('SIGKILL');
++      check('24B-12 invalid COS_RUN_UID: refuses to start (exit 1), never serves as root, disk untouched', r && r.code === 1 && /REFUSING TO START/.test(b.log) && owner(disk) === '0:0' && !/on http:/.test(b.log), JSON.stringify(r) + b.log.slice(-200)); }
++    { const disk = mkdisk('zero'); const b = start(ENTRY, { ...penv(disk), COS_RUN_UID: '0' }); const r = await Promise.race([b.done, sleep(6000).then(() => null)]); if (!r) b.child.kill('SIGKILL');
++      check('24B-13 COS_RUN_UID=0 (root) is refused', r && r.code === 1 && !/on http:/.test(b.log), JSON.stringify(r)); }
++
++    // symlink safety
++    { const disk = mkdisk('sym'), outside = mkdisk('symout'); fs.writeFileSync(path.join(outside, 'real.db'), '');
++      fs.symlinkSync(path.join(outside, 'real.db'), path.join(disk, 'cos.db'));
++      const b = start(ENTRY, { ...penv(disk), COS_INIT_DB: '0' }); const r = await Promise.race([b.done, sleep(6000).then(() => null)]); if (!r) b.child.kill('SIGKILL');
++      check('24B-14 symlinked DB path is never chowned and the server refuses it (guard)', owner(path.join(outside, 'real.db')) === '0:0' && /not chowning symlink/.test(b.log) && r && r.code === 3, owner(path.join(outside, 'real.db')) + ' ' + JSON.stringify(r) + b.log.slice(-200)); }
++  } catch (e) { check('test run completed without exception', false, e && e.stack); }
++  console.log(`\nTEST24 result=${failed === 0 ? 'PASS' : 'FAIL'} passed=${passed} failed=${failed}`);
++  process.exit(failed === 0 ? 0 : 1);
++})();

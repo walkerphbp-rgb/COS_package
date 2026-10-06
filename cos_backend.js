@@ -39,7 +39,13 @@
  *  - The backend never sees or needs Gemini/Groq keys.
  *
  * Env:
- *   COS_DB               path to SQLite file        (default ./test17.db)
+ *   COS_DB_PATH          path to SQLite file        (default ./cos.db beside this file).
+ *                        COS_DB is still honoured as a legacy alias.
+ *   COS_REQUIRE_PERSISTENT  1 = FAIL CLOSED at boot unless the DB path is inside
+ *                        COS_PERSISTENT_ROOT (root exists, DB dir writable). Production:
+ *                        COS_DB_PATH=/data/cos.db COS_PERSISTENT_ROOT=/data
+ *   COS_PERSISTENT_ROOT  the directory the platform persists (e.g. a Render disk mount)
+ *   COS_SHUTDOWN_GRACE_MS  SIGTERM/SIGINT drain window for in-flight requests (default 25000)
  *   PORT / COS_PORT      listen port. PORT (set by most hosts) wins, then
  *                        COS_PORT, then 8787.
  *   COS_HOST             default 127.0.0.1  (0.0.0.0 inside a container/for LAN)
@@ -88,9 +94,11 @@ const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { runLiveMission } = require('./mission_chain');
 const { gateExecuteInTx } = require('./gate');
-const { migrate, guardStatus } = require('./db_migrations');
+const { guardStatus, migrateVersioned, SCHEMA_VERSION } = require('./db_migrations');
+const persistence = require('./persistence');
 
-const DB_PATH = path.resolve(process.env.COS_DB || path.join(__dirname, 'test17.db'));
+const PCFG = persistence.resolveConfig(process.env, __dirname);
+const DB_PATH = PCFG.dbPath;
 const PORT = Number(process.env.PORT || process.env.COS_PORT || 8787);
 const VERSION = '1.2.0';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
@@ -113,6 +121,14 @@ const MODELS = {
 };
 const MAX_BODY = 8 * 1024;
 const SPECIALISTS = ['researcher', 'analyst', 'creator', 'critic'];
+
+/* ---------------- persistence guard (fail closed) ---------------- */
+const PGUARD = persistence.checkGuard(PCFG, { readonly: READONLY });
+if (!PGUARD.ok) {
+  console.error(`REFUSING TO START (persistence guard): ${PGUARD.errors.join('; ')}.\n` +
+    'Fix the disk mount / COS_DB_PATH / COS_PERSISTENT_ROOT, or unset COS_REQUIRE_PERSISTENT for local development.');
+  process.exit(3);
+}
 
 /* ---------------- auth ---------------- */
 const sha = s => crypto.createHash('sha256').update(String(s)).digest();
@@ -157,8 +173,14 @@ function initDbIfRequested() {
   if (READONLY) return 'COS_INIT_DB ignored: COS_READONLY=1';
   if (!fs.existsSync(SCHEMA_PATH)) return `COS_INIT_DB set but schema file not found: ${SCHEMA_PATH}`;
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-  const db = new DatabaseSync(DB_PATH);
+  // Build beside the target then rename: a crash mid-init leaves only a stray temp file, never a
+  // half-created cos.db that every later boot would treat as "already exists".
+  const tmpPath = `${DB_PATH}.init-${process.pid}`;
+  try { fs.rmSync(tmpPath, { force: true }); } catch {}
+  const db = new DatabaseSync(tmpPath);
   try { db.exec(fs.readFileSync(SCHEMA_PATH, 'utf8')); } finally { db.close(); }
+  if (fs.existsSync(DB_PATH)) { fs.rmSync(tmpPath, { force: true }); return null; }
+  fs.renameSync(tmpPath, DB_PATH);
   return `created EMPTY database from ${path.basename(SCHEMA_PATH)}`;
 }
 
@@ -166,7 +188,7 @@ function open(write) {
   if (write && READONLY) throw Object.assign(new Error('Backend is in read-only (evidence) mode'), { status: 403 });
   if (!fs.existsSync(DB_PATH)) throw Object.assign(new Error('Database file not found'), { status: 503 });
   const db = new DatabaseSync(DB_PATH);
-  db.exec('PRAGMA busy_timeout = 5000;');
+  db.exec(`PRAGMA busy_timeout = ${persistence.BUSY_TIMEOUT_MS};`);
   if (READONLY) db.exec('PRAGMA query_only = ON;');
   if (write) {
     db.exec(`CREATE TABLE IF NOT EXISTS backend_events (
@@ -373,10 +395,19 @@ function serveDashboard(req, res) {
   res.end(req.method === 'HEAD' ? undefined : buf);
 }
 function health(req, res) {
-  let present = fs.existsSync(DB_PATH), readable = false, guards = null;
-  if (present) { let db; try { db = new DatabaseSync(DB_PATH); db.prepare('SELECT 1 FROM decisions LIMIT 1').get(); readable = true; guards = guardStatus(db); } catch {} finally { try { db && db.close(); } catch {} } }
+  let present = fs.existsSync(DB_PATH), readable = false, guards = null, journalMode = null, userVersion = null;
+  if (present) { let db; try { db = new DatabaseSync(DB_PATH); db.prepare('SELECT 1 FROM decisions LIMIT 1').get(); readable = true; guards = guardStatus(db);
+    journalMode = String(Object.values(db.prepare('PRAGMA journal_mode').get())[0]).toLowerCase();
+    userVersion = Number(Object.values(db.prepare('PRAGMA user_version').get())[0]); } catch {} finally { try { db && db.close(); } catch {} } }
+  // Persistence evidence. No secrets, tokens, keys or DB contents; just where the bytes live.
+  const p = persistence.inspect(PCFG);
+  const persistenceBlock = { ...p,
+    guard: !p.require_persistent ? 'not_required' : PGUARD.ok ? 'pass' : 'fail',
+    using_persistent_location: p.require_persistent ? p.db_path_inside_root === true : null };
   const body = JSON.stringify({ ok: true, service: 'chief-of-staff-backend', version: VERSION, mode: MODE, read_only: READONLY,
-    db: { present, readable, guards }, init: { enabled: INIT_DB, result: INIT_RESULT }, time: nowISO() });
+    db: { present, readable, guards, journal_mode: journalMode, busy_timeout_ms: persistence.BUSY_TIMEOUT_MS,
+      schema: { user_version: userVersion, expected: SCHEMA_VERSION, ok: userVersion === SCHEMA_VERSION, migration: MIGRATION_SUMMARY } },
+    persistence: persistenceBlock, init: { enabled: INIT_DB, result: INIT_RESULT }, shutting_down: shuttingDown, time: nowISO() });
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', ...SEC });
   res.end(req.method === 'HEAD' ? undefined : body);
 }
@@ -395,7 +426,11 @@ function readBody(req) {
   });
 }
 
+let shuttingDown = false;
+let inflight = 0;
 const server = http.createServer(async (req, res) => {
+  if (shuttingDown) { res.writeHead(503, { 'Content-Type': 'application/json', Connection: 'close', 'Retry-After': '5' }); return res.end(JSON.stringify({ ok: false, error: 'Server is shutting down; retry shortly' })); }
+  inflight++; res.on('close', () => { inflight--; });
   cors(req, res);
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   try {
@@ -463,17 +498,33 @@ const server = http.createServer(async (req, res) => {
 
 let initNote = null;
 try { initNote = initDbIfRequested(); } catch (e) { initNote = 'DB init failed: ' + e.message; }
-// Path-free summary for the public /health probe (the full note, with paths, stays in the console only).
-let MIGRATION = { ok: null, applied: [], warnings: ['not run'] };
+// Summary for the public /health probe (counts only; the full detail stays in the console).
+let MIGRATION = { fatal: false, errors: [], report: null };
+let MIGRATION_SUMMARY = { ran: false };
 if (!READONLY && fs.existsSync(DB_PATH)) {
-  try { const d = new DatabaseSync(DB_PATH); try { MIGRATION = migrate(d); } finally { d.close(); } }
-  catch (e) { MIGRATION = { ok: false, applied: [], warnings: [`migration failed: ${e.message}`] }; }
-  console.log(`DB guards: ok=${MIGRATION.ok} applied=${MIGRATION.applied.length} warnings=${MIGRATION.warnings.length + (MIGRATION.skipped || []).length}`);
+  try {
+    const d = new DatabaseSync(DB_PATH);
+    try {
+      const mode = persistence.bootPragmas(d);
+      MIGRATION = migrateVersioned(d);
+      MIGRATION_SUMMARY = { ran: true, ok: !MIGRATION.fatal, version_before: MIGRATION.version_before, version_after: MIGRATION.version_after,
+        applied: MIGRATION.report ? MIGRATION.report.applied.length : 0, warnings: MIGRATION.errors.length + (MIGRATION.report ? MIGRATION.report.skipped.length : 0) };
+      console.log(`DB: journal_mode=${mode} busy_timeout=${persistence.BUSY_TIMEOUT_MS}ms user_version=${MIGRATION.version_after}/${SCHEMA_VERSION}`);
+    } finally { d.close(); }
+  } catch (e) { MIGRATION = { fatal: true, errors: [`migration failed: ${e.message}`], report: null }; }
+  if (MIGRATION.fatal) {
+    console.error(`REFUSING TO START (migration/schema check failed): ${MIGRATION.errors.join('; ')}.\nThe database was not modified beyond additive guards; nothing was reset or recreated.`);
+    process.exit(4);
+  }
+  console.log(`DB guards: applied=${MIGRATION.report.applied.length} warnings=${MIGRATION.report.warnings.length + MIGRATION.report.skipped.length}`);
+} else if (READONLY && fs.existsSync(DB_PATH)) {
+  try { const d = new DatabaseSync(DB_PATH); try { d.exec(`PRAGMA busy_timeout = ${persistence.BUSY_TIMEOUT_MS}`); } finally { d.close(); } } catch {}
 }
 const INIT_RESULT = !INIT_DB ? 'disabled' : initNote === null ? 'not_needed' : /^created/.test(initNote) ? 'created' : /ignored: COS_READONLY/.test(initNote) ? 'skipped' : 'failed';
 
 server.listen(PORT, HOST, () => {
   console.log(`Chief of Staff backend v${VERSION} on http://${HOST}:${PORT}  (mode=${MODE}${READONLY ? ', READ-ONLY' : ''})`);
+  console.log(`Persistence: require=${PCFG.requirePersistent} root=${PCFG.persistentRoot || '-'} guard=${PCFG.requirePersistent ? 'pass' : 'not_required'} (db path from ${PCFG.dbPathSource})`);
   console.log(`DB: ${DB_PATH}${fs.existsSync(DB_PATH) ? '' : '   <-- NOT FOUND yet (set COS_INIT_DB=1 to create an empty one)'}`);
   if (initNote) console.log(`DB init: ${initNote}`);
   console.log(`Dashboard file: ${fs.existsSync(DASHBOARD_PATH) ? 'found' : 'NOT FOUND'}  |  health: GET /health`);
@@ -482,4 +533,28 @@ server.listen(PORT, HOST, () => {
     ? 'Listening beyond loopback; HTTPS is assumed to be terminated in front of this process (COS_TLS_TERMINATED=1).'
     : 'WARNING: listening beyond loopback over plain HTTP — the token can be sniffed on shared networks. Put HTTPS in front of it (set COS_TLS_TERMINATED=1 once you have).');
 });
-for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { console.log(`${sig}: shutting down`); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 5000).unref(); });
+/* Graceful shutdown (Render redeploys send SIGTERM). Stop accepting work, let requests already
+ * running finish (each one closes its own SQLite connection in its finally block), then checkpoint
+ * the WAL and exit. Nothing is written on behalf of work that did not finish: a request cut off by the
+ * deadline is simply logged. No synthetic COMPLETED/FAILED rows, no gate involvement. */
+const GRACE_MS = Math.max(1000, Number(process.env.COS_SHUTDOWN_GRACE_MS) || 25000);
+function shutdown(sig) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${sig}: draining ${inflight} in-flight request(s), grace ${GRACE_MS}ms`);
+  server.close();
+  try { server.closeIdleConnections(); } catch {}
+  const started = Date.now();
+  const finish = () => {
+    const forced = inflight > 0;
+    if (forced) console.error(`SHUTDOWN: grace expired with ${inflight} request(s) still running; exiting without recording anything on their behalf`);
+    if (!READONLY && fs.existsSync(DB_PATH)) {
+      try { const d = new DatabaseSync(DB_PATH); try { d.exec(`PRAGMA busy_timeout = ${persistence.BUSY_TIMEOUT_MS}`); d.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } finally { d.close(); } }
+      catch (e) { console.error('SHUTDOWN: WAL checkpoint skipped: ' + e.message); }
+    }
+    console.log(`SHUTDOWN: ${forced ? 'forced' : 'clean'} after ${Date.now() - started}ms`);
+    process.exit(forced ? 1 : 0);
+  };
+  const t = setInterval(() => { try { server.closeIdleConnections(); } catch {} if (inflight === 0 || Date.now() - started >= GRACE_MS) { clearInterval(t); finish(); } }, 100);
+}
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => shutdown(sig));

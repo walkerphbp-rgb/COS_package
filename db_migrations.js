@@ -41,4 +41,32 @@ function guardStatus(db) {
   const missing = want.filter(([ty, n]) => !db.prepare(`SELECT 1 FROM sqlite_master WHERE type=? AND name=?`).get(ty, n)).map(x => x[1]);
   return { ok: missing.length === 0, missing };
 }
-module.exports = { migrate, guardStatus, APPEND_ONLY };
+
+/* ---- Schema versioning (PRAGMA user_version) ----
+ * v0 = a DB that predates versioning (every DB created before this change, including production).
+ * v1 = base test17 schema + the append-only guards from migrate(). Stamping v0 -> v1 changes no data.
+ * A DB stamped NEWER than this code understands is refused (an older build must not run on a newer
+ * schema). A migration that throws, or that cannot create a required table/trigger, is FATAL.
+ * A legacy-duplicate execution_log index skip stays non-fatal (documented in Test 21D-7). */
+const SCHEMA_VERSION = 1;
+const CORE_TABLES = ['missions', 'decisions', 'execution_log', 'critic_reviews'];
+
+function migrateVersioned(db) {
+  const out = { schema_version: SCHEMA_VERSION, version_before: null, version_after: null, fatal: false, errors: [], report: null };
+  const getV = () => Number(Object.values(db.prepare('PRAGMA user_version').get())[0]);
+  try {
+    out.version_before = getV();
+    if (out.version_before > SCHEMA_VERSION) {
+      out.fatal = true; out.errors.push(`database schema version ${out.version_before} is newer than this build supports (${SCHEMA_VERSION}); refusing to run an older build on a newer schema`);
+      out.version_after = out.version_before; return out;
+    }
+    const missing = CORE_TABLES.filter(t => !db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(t));
+    if (missing.length) { out.fatal = true; out.errors.push(`core table(s) missing: ${missing.join(', ')}; refusing to run on an incompatible schema`); out.version_after = out.version_before; return out; }
+    out.report = migrate(db);
+    if (out.report.warnings.length) { out.fatal = true; out.errors.push(...out.report.warnings); }
+    if (!out.fatal && out.version_before < SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    out.version_after = getV();
+  } catch (e) { out.fatal = true; out.errors.push(`migration failed: ${e.message}`); }
+  return out;
+}
+module.exports = { migrate, guardStatus, APPEND_ONLY, SCHEMA_VERSION, CORE_TABLES, migrateVersioned };

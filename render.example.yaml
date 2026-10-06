@@ -1,0 +1,37 @@
+# REFERENCE / DOCUMENTATION ONLY. This file is NOT named render.yaml on purpose: it configures nothing by
+# existing in the repo, and it does NOT mean a disk is attached. The real service is configured in the Render
+# Dashboard (Disks page + Environment page), or by creating a Blueprint from this file yourself.
+# Required on the REAL service: a Persistent Disk mounted at /data, and these env vars:
+#   COS_DB_PATH=/data/cos.db  COS_PERSISTENT_ROOT=/data  COS_REQUIRE_PERSISTENT=1
+# Render Blueprint (reference). Persistent Disks require a paid instance type and pin the service to
+# ONE instance (no zero-downtime deploys). Only files under the disk mountPath survive redeploys.
+# Not applied to any real service: IMPLEMENTED / LIVE-VALIDATION PENDING.
+services:
+  - type: web
+    name: chief-of-staff
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    disk:
+      name: cos-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: COS_DB_PATH
+        value: /data/cos.db
+      - key: COS_PERSISTENT_ROOT
+        value: /data
+      - key: COS_REQUIRE_PERSISTENT
+        value: "1"
+      - key: COS_HOST
+        value: 0.0.0.0
+      - key: COS_TLS_TERMINATED
+        value: "1"
+      - key: COS_MODE
+        value: LIVE
+      - key: COS_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false

@@ -6,20 +6,27 @@
 
 FROM node:22-bookworm-slim
 
-# Runs as the unprivileged "node" user by default. Some hosts mount volumes owned by root; if the
-# logs say "unable to open database file" / EACCES on /data, rebuild with:  --build-arg RUN_AS=root
-ARG RUN_AS=node
+# The entrypoint starts as root ONLY to chown the persistent directory (hosts mount a fresh disk
+# root-owned, and it cannot be fixed at build time), then drops to the unprivileged "node" user
+# (uid/gid 1000, override with COS_RUN_UID / COS_RUN_GID) before the server code loads. If the drop
+# fails it exits instead of running as root. `docker run --user node ...` also works (chown is skipped).
 
 WORKDIR /app
-COPY cos_backend.js chief_of_staff_dashboard.html test17_schema.sql mission_chain.js provider_fallback.js gate.js db_migrations.js ./
+COPY cos_backend.js chief_of_staff_dashboard.html test17_schema.sql mission_chain.js provider_fallback.js gate.js db_migrations.js persistence.js docker-entrypoint.js ./
 
 # /data is where the SQLite file lives. Mount a PERSISTENT VOLUME here or every redeploy starts empty.
+# The persistence REQUIREMENT is deliberately NOT baked into the image: set COS_REQUIRE_PERSISTENT=1 in the
+# deployment environment (e.g. the Render service's env vars) so local `docker run` / compose still work
+# without a volume. In production, without it the server will happily write to ephemeral storage.
+# Note /data exists in the image even with no disk attached, so a guard alone cannot detect a missing
+# mount: /health reports root_on_separate_filesystem as evidence, and the redeploy test is the real proof.
 RUN mkdir -p /data && chown -R node:node /data /app
 VOLUME ["/data"]
 
 ENV NODE_ENV=production \
     COS_HOST=0.0.0.0 \
-    COS_DB=/data/cos.db \
+    COS_DB_PATH=/data/cos.db \
+    COS_PERSISTENT_ROOT=/data \
     COS_INIT_DB=1 \
     COS_SCHEMA=/app/test17_schema.sql \
     COS_DASHBOARD=/app/chief_of_staff_dashboard.html \
@@ -29,10 +36,9 @@ ENV NODE_ENV=production \
 
 # PORT (injected by most hosts) wins over COS_PORT; default 8787.
 EXPOSE 8787
-USER ${RUN_AS}
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||process.env.COS_PORT||8787)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-CMD ["node", "cos_backend.js"]
+CMD ["node", "docker-entrypoint.js"]
 
