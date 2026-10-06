@@ -32,6 +32,7 @@
 'use strict';
 const crypto = require('crypto');
 const { callWithFallback, toProviderCallRow } = require('./provider_fallback');
+const { gateExecuteInTx, SYSTEM_APPROVAL_TEXT } = require('./gate');
 
 function nowISO() { return new Date().toISOString(); }
 function uuid() { return crypto.randomUUID(); }
@@ -233,7 +234,6 @@ async function runAnalyst(db, { missionId, callSeq, requestText, claimIds, keys,
   `).run(missionId, providerCallId, JSON.stringify(claimIds), result.response.summary, result.response.llm_self_tier, nowISO());
 const cur = db.prepare(`SELECT risk_tier FROM missions WHERE id = ?`).get(missionId).risk_tier;
 riskTier = maxTier(cur, riskTier);
-db.prepare(`UPDATE missions SET risk_tier = ? WHERE id = ?`).run(riskTier, missionId);
   db.prepare(`UPDATE missions SET risk_tier = ? WHERE id = ?`).run(riskTier, missionId);
   const usage = result.response && result.response.__usage ? result.response.__usage : null;
   recordDecision(db, missionId, 'ANALYZED',
@@ -286,15 +286,6 @@ function runCritic(db, { missionId, artifactId, claims, grounded, nonceInPayload
 
 // The approval boundary — same function shape as cos_backend.js's gateExecute.
 // Only place EXECUTED is written; re-reads APPROVED from the DB.
-function execute(db, missionId) {
-  const row = db.prepare(`SELECT id FROM decisions WHERE mission_id = ? AND status = 'APPROVED' ORDER BY id DESC LIMIT 1`).get(missionId);
-  if (!row) throw new Error(`BOUNDARY VIOLATION BLOCKED: mission ${missionId} has no APPROVED decision row — execution refused`);
-  const ts = nowISO();
-  db.prepare(`INSERT INTO execution_log (mission_id, detail, created_at) VALUES (?, ?, ?)`)
-    .run(missionId, `executed under decision id=${row.id}`, ts);
-  recordDecision(db, missionId, 'EXECUTED', `executed under decision id=${row.id}`);
-  recordDecision(db, missionId, 'COMPLETED', 'mission complete');
-}
 
 /**
  * Runs one full live mission through the real chain. Throws on any hard
@@ -327,9 +318,19 @@ try {
 
   let outcome;
   if (autoEligible) {
-    recordDecision(db, missionId, 'APPROVED', 'auto: low risk tier + critic PASS, no human input required');
-    execute(db, missionId);
-    outcome = 'AUTO_COMPLETED';
+    // Approval + execution in ONE transaction through the canonical gate. If the gate refuses,
+    // nothing is written and the mission fails closed to a human.
+    let gateErr = null;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      recordDecision(db, missionId, 'APPROVED', SYSTEM_APPROVAL_TEXT);
+      gateExecuteInTx(db, missionId, nowISO());
+      db.exec('COMMIT');
+    } catch (e) { try { db.exec('ROLLBACK'); } catch {} gateErr = e; }
+    if (gateErr) {
+      recordDecision(db, missionId, 'AWAITING_APPROVAL', `gate refused system approval: ${String(gateErr.message).slice(0, 300)}`);
+      outcome = 'AWAITING_APPROVAL';
+    } else outcome = 'AUTO_COMPLETED';
   } else {
     recordDecision(db, missionId, 'AWAITING_APPROVAL', `risk_tier=${riskTier} critic_verdict=${criticVerdict}`);
     outcome = 'AWAITING_APPROVAL';
@@ -355,4 +356,4 @@ try {
   } catch (e) { e.missionId = missionId; throw e; }
 }
 
-module.exports = { runLiveMission, runAnalyst, execute, computeRiskTierFromClaims, containsInjectionPattern };
+module.exports = { runLiveMission, runAnalyst, computeRiskTierFromClaims, containsInjectionPattern };

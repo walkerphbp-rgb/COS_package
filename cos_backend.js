@@ -32,7 +32,7 @@
  *  - Approval requires the mission's LATEST decision row to be
  *    AWAITING_APPROVAL, checked inside a write transaction (no double
  *    decisions, no approving a rejected/completed/in-progress mission).
- *  - Execution goes through gateExecute(), a copy of Test 17's execute(): it
+ *  - Execution goes through the canonical gate.js (gateExecuteInTx, same transaction as the approval): it
  *    re-reads the APPROVED row from the DB and refuses otherwise.
  *  - Decisions are append-only INSERTs into `decisions`. Nothing is UPDATEd
  *    or DELETEd. Refused attempts are logged to `backend_events`.
@@ -87,6 +87,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { runLiveMission } = require('./mission_chain');
+const { gateExecuteInTx } = require('./gate');
+const { migrate, guardStatus } = require('./db_migrations');
 
 const DB_PATH = path.resolve(process.env.COS_DB || path.join(__dirname, 'test17.db'));
 const PORT = Number(process.env.PORT || process.env.COS_PORT || 8787);
@@ -238,7 +240,7 @@ function buildSnapshot() {
       if (lastVerdict && lastVerdict !== 'PASS') reasons.push('Critic verdict ' + lastVerdict);
       const approval =
         st === 'REJECTED' || d.some(x => x.status === 'REJECTED') ? 'REJECTED'
-        : approved ? (/^auto:/i.test(approved.rationale) ? 'AUTO (LOW TIER)' : 'APPROVED')
+        : approved ? (/^(auto|system):/i.test(approved.rationale) ? 'AUTO (LOW TIER)' : 'APPROVED')
         : st === 'AWAITING_APPROVAL' ? 'PENDING' : 'NOT REQUIRED';
       return {
         id: m.id, objective: m.request_text,
@@ -322,17 +324,6 @@ function buildSnapshot() {
 }
 
 /* ---------------- decision (the approval boundary) ---------------- */
-// Copy of Test 17 execute(): only place EXECUTED is written; re-reads APPROVED from the DB.
-function gateExecute(db, missionId, ts) {
-  const row = db.prepare(`SELECT id FROM decisions WHERE mission_id = ? AND status = 'APPROVED' ORDER BY id DESC LIMIT 1`).get(missionId);
-  if (!row) throw new Error(`BOUNDARY VIOLATION BLOCKED: mission ${missionId} has no APPROVED decision row — execution refused`);
-  const later = db.prepare(`SELECT 1 FROM decisions WHERE mission_id = ? AND id > ? AND status = 'REJECTED'`).get(missionId, row.id);
-  if (later) throw new Error(`BOUNDARY VIOLATION BLOCKED: mission ${missionId} was rejected after approval`);
-  db.prepare(`INSERT INTO execution_log (mission_id, detail, created_at) VALUES (?,?,?)`).run(missionId, `executed under decision id=${row.id}`, ts);
-  db.prepare(`INSERT INTO decisions (mission_id,status,rationale,created_at) VALUES (?,?,?,?)`).run(missionId, 'EXECUTED', `executed under decision id=${row.id}`, ts);
-  db.prepare(`INSERT INTO decisions (mission_id,status,rationale,created_at) VALUES (?,?,?,?)`).run(missionId, 'COMPLETED', 'mission complete', ts);
-}
-
 function decide(missionId, decision, actor) {
   const db = open(true);
   try {
@@ -353,7 +344,7 @@ function decide(missionId, decision, actor) {
         return { code: 200, body: { ok: true, state: 'REJECTED', decided_by: actor } };
       }
       ins.run(missionId, 'APPROVED', `human: approved by ${actor} via operator dashboard`, ts);
-      gateExecute(db, missionId, ts); // same transaction: if it throws, the approval rolls back too
+      gateExecuteInTx(db, missionId, ts); // canonical gate, same transaction: a refusal rolls the approval back too
       db.exec('COMMIT');
       return { code: 200, body: { ok: true, state: 'COMPLETED', decided_by: actor } };
     } catch (e) { try { db.exec('ROLLBACK'); } catch {} throw e; }
@@ -382,10 +373,10 @@ function serveDashboard(req, res) {
   res.end(req.method === 'HEAD' ? undefined : buf);
 }
 function health(req, res) {
-  let present = fs.existsSync(DB_PATH), readable = false;
-  if (present) { let db; try { db = new DatabaseSync(DB_PATH); db.prepare('SELECT 1 FROM decisions LIMIT 1').get(); readable = true; } catch {} finally { try { db && db.close(); } catch {} } }
+  let present = fs.existsSync(DB_PATH), readable = false, guards = null;
+  if (present) { let db; try { db = new DatabaseSync(DB_PATH); db.prepare('SELECT 1 FROM decisions LIMIT 1').get(); readable = true; guards = guardStatus(db); } catch {} finally { try { db && db.close(); } catch {} } }
   const body = JSON.stringify({ ok: true, service: 'chief-of-staff-backend', version: VERSION, mode: MODE, read_only: READONLY,
-    db: { present, readable }, init: { enabled: INIT_DB, result: INIT_RESULT }, time: nowISO() });
+    db: { present, readable, guards }, init: { enabled: INIT_DB, result: INIT_RESULT }, time: nowISO() });
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', ...SEC });
   res.end(req.method === 'HEAD' ? undefined : body);
 }
@@ -463,15 +454,22 @@ const server = http.createServer(async (req, res) => {
     send(res, 404, { ok: false, error: 'Not found' });
   } catch (e) {
     const code = e.status || 500;
-    if (String(e.message).startsWith('BOUNDARY VIOLATION')) logEvent(null, 'EXECUTION_BLOCKED', e.message, null);
-    send(res, code, { ok: false, error: code === 500 ? 'Internal error' : e.message });
-    if (code === 500) console.error(e);
+    const gateRefusal = String(e.message).startsWith('BOUNDARY VIOLATION');
+    if (gateRefusal) logEvent(null, 'EXECUTION_BLOCKED', e.message, null);
+    send(res, gateRefusal ? 409 : code, { ok: false, error: code === 500 && !gateRefusal ? 'Internal error' : e.message });
+    if (code === 500 && !gateRefusal) console.error(e);
   }
 });
 
 let initNote = null;
 try { initNote = initDbIfRequested(); } catch (e) { initNote = 'DB init failed: ' + e.message; }
 // Path-free summary for the public /health probe (the full note, with paths, stays in the console only).
+let MIGRATION = { ok: null, applied: [], warnings: ['not run'] };
+if (!READONLY && fs.existsSync(DB_PATH)) {
+  try { const d = new DatabaseSync(DB_PATH); try { MIGRATION = migrate(d); } finally { d.close(); } }
+  catch (e) { MIGRATION = { ok: false, applied: [], warnings: [`migration failed: ${e.message}`] }; }
+  console.log(`DB guards: ok=${MIGRATION.ok} applied=${MIGRATION.applied.length} warnings=${MIGRATION.warnings.length + (MIGRATION.skipped || []).length}`);
+}
 const INIT_RESULT = !INIT_DB ? 'disabled' : initNote === null ? 'not_needed' : /^created/.test(initNote) ? 'created' : /ignored: COS_READONLY/.test(initNote) ? 'skipped' : 'failed';
 
 server.listen(PORT, HOST, () => {

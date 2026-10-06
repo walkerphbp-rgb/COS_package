@@ -11,7 +11,7 @@ FROM node:22-bookworm-slim
 ARG RUN_AS=node
 
 WORKDIR /app
-COPY cos_backend.js chief_of_staff_dashboard.html test17_schema.sql mission_chain.js provider_fallback.js ./
+COPY cos_backend.js chief_of_staff_dashboard.html test17_schema.sql mission_chain.js provider_fallback.js gate.js db_migrations.js ./
 
 # /data is where the SQLite file lives. Mount a PERSISTENT VOLUME here or every redeploy starts empty.
 RUN mkdir -p /data && chown -R node:node /data /app

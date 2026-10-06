@@ -6,7 +6,7 @@ const path = require('path'), crypto = require('crypto');
 module.exports = function load(target, repoDir) {
   let fn, src;
   if (target === 'original') {
-    fn = require(path.join(repoDir, 'mission_chain.js')).execute;
+    fn = require(path.join(__dirname, 'legacy_execute.js')).execute;
     if (typeof fn !== 'function') throw new Error('original execute() not found');
     src = fn.toString();
     if (/exactly-once|preceding AWAITING/.test(src)) throw new Error('"original" contains fixed-gate logic');
