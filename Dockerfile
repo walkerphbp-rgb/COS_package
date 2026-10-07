@@ -19,9 +19,11 @@ COPY cos_backend.js chief_of_staff_dashboard.html test17_schema.sql mission_chai
 # deployment environment (e.g. the Render service's env vars) so local `docker run` / compose still work
 # without a volume. In production, without it the server will happily write to ephemeral storage.
 # Note /data exists in the image even with no disk attached, so a guard alone cannot detect a missing
-# mount: /health reports root_on_separate_filesystem as evidence, and the redeploy test is the real proof.
+# mount: /health reports root_on_dedicated_mount as evidence (set COS_REQUIRE_MOUNT=1 to enforce it), and the redeploy
+# test is the real proof.
 RUN mkdir -p /data && chown -R node:node /data /app
-VOLUME ["/data"]
+# Deliberately NO `VOLUME ["/data"]`: a runtime that honours it silently mounts an ANONYMOUS, EPHEMERAL volume
+# at /data when no real disk is attached. That looks like a dedicated mount in /health but is erased on redeploy.
 
 ENV NODE_ENV=production \
     COS_HOST=0.0.0.0 \
