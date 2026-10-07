@@ -74,6 +74,23 @@ const expectRefusal = async (env, code) => { const b = boot(env); const r = awai
       check('23A-8 no variables: local default ./cos.db, absolute, guard not required', path.isAbsolute(cfg.dbPath) && cfg.dbPath.endsWith('cos.db') && persistence.checkGuard(cfg).ok && !cfg.requirePersistent); }
     { const cfg = persistence.resolveConfig({ COS_DB: 'rel/legacy.db' }, __dirname);
       check('23A-9 legacy COS_DB still honoured, resolved absolute', path.isAbsolute(cfg.dbPath) && cfg.dbPathSource === 'COS_DB (legacy)'); }
+    // 23F: dedicated-mount evidence (fake mountinfo files; the real one differs per host)
+    { const line = (mp) => `36 35 98:0 /x ${mp} rw,relatime - ext4 /dev/sda1 rw`;
+      const withDisk = path.join(tmp, 'mi_disk'), noDisk = path.join(tmp, 'mi_nodisk'), spaced = path.join(tmp, 'mi_space');
+      fs.writeFileSync(withDisk, [line('/'), line('/proc'), line('/data')].join('\n') + '\n');
+      fs.writeFileSync(noDisk, [line('/'), line('/proc'), line('/dev')].join('\n') + '\n');
+      fs.writeFileSync(spaced, [line('/'), line('/my\\040disk')].join('\n') + '\n');
+      const root = mk('F1root'), env = { COS_DB_PATH: path.join(root, 'cos.db'), COS_REQUIRE_PERSISTENT: '1', COS_PERSISTENT_ROOT: root };
+      check('23F-1 containingMount: own mount point wins over "/", prefix must end on a path boundary', persistence.containingMount('/data/sub', withDisk) === '/data' && persistence.containingMount('/database', withDisk) === '/' && persistence.containingMount('/data', withDisk) === '/data');
+      check('23F-2 containingMount: folder inside the image resolves to "/" (the Render Free / no-disk case)', persistence.containingMount('/data', noDisk) === '/');
+      check('23F-3 containingMount: unreadable mount table -> null; octal-escaped spaces decoded', persistence.containingMount('/data', path.join(tmp, 'missing')) === null && persistence.containingMount('/my disk/x', spaced) === '/my disk');
+      const cfg = persistence.resolveConfig({ ...env }, __dirname); const cfgM = persistence.resolveConfig({ ...env, COS_REQUIRE_MOUNT: '1' }, __dirname);
+      const rootReal = fs.realpathSync(root), fake = (mp) => { const f = path.join(tmp, 'mi_' + mp.replace(/\W/g, '_')); fs.writeFileSync(f, [line('/'), line(mp)].join('\n') + '\n'); return f; };
+      check('23F-4 /health evidence: root_on_dedicated_mount false when no disk, true when the root is its own mount', persistence.inspect(cfg, { mountinfoPath: noDisk }).root_on_dedicated_mount === false && persistence.inspect(cfg, { mountinfoPath: fake(rootReal) }).root_on_dedicated_mount === true);
+      check('23F-5 REQUIRE_PERSISTENT alone does not enforce the mount (documented limitation)', persistence.checkGuard(cfg, { mountinfoPath: noDisk }).ok);
+      const gNo = persistence.checkGuard(cfgM, { mountinfoPath: noDisk }), gYes = persistence.checkGuard(cfgM, { mountinfoPath: fake(rootReal) }), gUnk = persistence.checkGuard(cfgM, { mountinfoPath: path.join(tmp, 'missing') });
+      check('23F-6 COS_REQUIRE_MOUNT=1: refused with no dedicated mount, accepted with one, refused (fail closed) when unverifiable', !gNo.ok && /not on a dedicated mount/.test(gNo.errors.join()) && gYes.ok && !gUnk.ok && /could not be read/.test(gUnk.errors.join()), JSON.stringify([gNo.errors, gYes.errors, gUnk.errors]));
+    }
     if (process.getuid && process.getuid() === 0) {
       const root = mk('A10root'); fs.chmodSync(root, 0o555); fs.chmodSync(tmp, 0o755);
       const code = `process.setuid(65534);const p=require(${JSON.stringify(path.join(__dirname, 'persistence.js'))});const g=p.checkGuard(p.resolveConfig({COS_DB_PATH:${JSON.stringify(path.join(root, 'cos.db'))},COS_REQUIRE_PERSISTENT:'1',COS_PERSISTENT_ROOT:${JSON.stringify(root)}},'/'));console.log(JSON.stringify({ok:g.ok,e:g.errors}))`;
