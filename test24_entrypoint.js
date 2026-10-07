@@ -30,6 +30,7 @@ check('24A-1 Dockerfile COPYs persistence.js and docker-entrypoint.js', /COPY[^\
 check('24A-2 Dockerfile starts through the entrypoint', /CMD \["node", "docker-entrypoint\.js"\]/.test(dockerCode));
 check('24A-3 COS_REQUIRE_PERSISTENT is NOT baked into the image (deployment decides)', !/COS_REQUIRE_PERSISTENT/.test(dockerCode));
 check('24A-4 image does not pin the whole container to USER root or a RUN_AS toggle', !/^\s*USER\s/m.test(dockerCode) && !/RUN_AS/.test(dockerCode));
+check('24A-6 Dockerfile declares no VOLUME (an anonymous ephemeral volume would fake a dedicated /data mount)', !/^\s*VOLUME\s/m.test(dockerCode));
 check('24A-5 Blueprint example is not named render.yaml (cannot imply a configured disk)', !fs.existsSync(path.join(__dirname, 'render.yaml')) && fs.existsSync(path.join(__dirname, 'render.example.yaml')) && /DOCUMENTATION ONLY/.test(df('render.example.yaml')));
 
 const isRoot = process.getuid && process.getuid() === 0;
