@@ -96,6 +96,8 @@ const { runLiveMission } = require('./mission_chain');
 const { gateExecuteInTx } = require('./gate');
 const { guardStatus, migrateVersioned, SCHEMA_VERSION } = require('./db_migrations');
 const persistence = require('./persistence');
+const { IN_PROGRESS, injected, deriveMission } = require('./mission_state');
+const memory = require('./decision_memory');
 
 const PCFG = persistence.resolveConfig(process.env, __dirname);
 const DB_PATH = PCFG.dbPath;
@@ -221,12 +223,8 @@ function logAuthFailure(detail) {
 }
 
 /* ---------------- snapshot ---------------- */
-const IN_PROGRESS = new Set(['RESEARCHED', 'ANALYZED', 'ARTIFACT_DRAFTED', 'ARTIFACT_VERIFIED']);
 const EVENT_NAME = { RESEARCHED: 'RESEARCH_COMPLETED', AWAITING_APPROVAL: 'APPROVAL_REQUESTED' };
 const BENIGN_EVENTS = new Set(['MISSION_SUBMITTED', 'MISSION_FAILED']);
-const INJECTION = [/ignore\s+(all\s+|previous\s+|prior\s+)?instructions/i, /pre[-\s]?approved/i,
-  /set\s+risk_tier\s*=\s*low/i, /bypass\s+approval/i, /auto[-\s]?approve/i];
-const injected = t => INJECTION.some(re => re.test(t || ''));
 
 function buildSnapshot() {
   const db = open(false);
@@ -247,35 +245,8 @@ function buildSnapshot() {
       claimBy = by(claims, 'mission_id'), critBy = by(critics, 'mission_id');
 
     const missions = missionsRaw.map(m => {
-      const d = decBy[m.id] || [];
-      const last = d[d.length - 1];
-      const st = last ? last.status : 'PROPOSED';
-      const approved = d.find(x => x.status === 'APPROVED');
-      const cs = callBy[m.id] || [];
-      const cr = critBy[m.id] || [];
-      const lastVerdict = cr.length ? cr[cr.length - 1].verdict : null;
-      const reasons = [];
-      for (const c of claimBy[m.id] || []) {
-        if (c.poisoned || injected(c.text)) reasons.push('Claim contained instruction-like text');
-        if (c.fetch_match === 0) reasons.push('Claim evidence not verified against fetched content');
-      }
-      if (lastVerdict && lastVerdict !== 'PASS') reasons.push('Critic verdict ' + lastVerdict);
-      const approval =
-        st === 'REJECTED' || d.some(x => x.status === 'REJECTED') ? 'REJECTED'
-        : approved ? (/^(auto|system):/i.test(approved.rationale) ? 'AUTO (LOW TIER)' : 'APPROVED')
-        : st === 'AWAITING_APPROVAL' ? 'PENDING' : 'NOT REQUIRED';
-      return {
-        id: m.id, objective: m.request_text,
-        status: IN_PROGRESS.has(st) ? 'IN_PROGRESS' : st,
-        risk_tier: String(m.risk_tier).toUpperCase(),
-        specialists: [...new Set([...cs.map(c => c.specialist), ...(cr.length ? ['critic'] : [])])],
-        provider_used: cs.length ? cs[cs.length - 1].provider_used : null,
-        fallback_used: cs.some(c => c.fallback_triggered === 1),
-        approval_status: approval,
-        execution_status: execCount[m.id] ? 'COMPLETED' : (approval === 'REJECTED' ? 'NOT EXECUTED' : 'NOT STARTED'),
-        created_at: m.created_at, updated_at: last ? last.created_at : m.created_at,
-        risk_reason: [...new Set(reasons)].join('; ') || (last && st === 'AWAITING_APPROVAL' ? last.rationale : ''),
-      };
+      const { _reasons, ...mm } = deriveMission(m, decBy[m.id] || [], callBy[m.id] || [], claimBy[m.id] || [], critBy[m.id] || [], execCount[m.id] || 0);
+      return mm;
     });
 
     const approvals = missions.filter(m => m.status === 'AWAITING_APPROVAL').map(m => ({
@@ -442,6 +413,21 @@ const server = http.createServer(async (req, res) => {
     if (!actor) { if (url.pathname.startsWith('/api/')) logAuthFailure(`${req.method} ${url.pathname}`); return send(res, 401, { ok: false, error: 'Missing or invalid bearer token' }); }
 
     if (req.method === 'GET' && url.pathname === '/api/snapshot') return send(res, 200, buildSnapshot());
+
+    /* Decision Memory (read-only). Three GET routes; each opens its own query_only handle. */
+    if (req.method === 'GET' && url.pathname.startsWith('/api/memory/')) {
+      const mm = /^\/api\/memory\/missions\/([A-Za-z0-9_-]{1,64})\/explain$/.exec(url.pathname);
+      const q = Object.fromEntries(url.searchParams);
+      const run = fn => {
+        if (!fs.existsSync(DB_PATH)) throw Object.assign(new Error('Database file not found'), { status: 503 });
+        const db = memory.openMemoryDb(DB_PATH, persistence.BUSY_TIMEOUT_MS);
+        try { return fn(db); } finally { try { db.close(); } catch {} }
+      };
+      if (url.pathname === '/api/memory/missions') return send(res, 200, { ok: true, ...run(db => memory.listMissions(db, q)) });
+      if (url.pathname === '/api/memory/search') return send(res, 200, { ok: true, ...run(db => memory.search(db, q)) });
+      if (mm) { const r = run(db => memory.explain(db, mm[1])); return r ? send(res, 200, { ok: true, ...r }) : send(res, 404, { ok: false, error: 'Mission not found' }); }
+      return send(res, 404, { ok: false, error: 'Not found' });
+    }
 
     if (req.method === 'POST' && url.pathname === '/api/missions') {
       if (READONLY) return send(res, 403, { ok: false, error: 'Backend is in read-only (evidence) mode; no mission can be run' });
