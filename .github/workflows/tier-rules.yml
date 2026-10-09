@@ -36,3 +36,5 @@ jobs:
         run: node test23_persistence.js
       - name: Run 24 (entrypoint + Dockerfile readiness; behavioural half skips when not root)
         run: node test24_entrypoint.js
+      - name: Run 25 (Decision Memory retrieval API)
+        run: node test25_decision_memory.js
