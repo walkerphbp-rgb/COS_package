@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "format_id": "general",
+  "format_version": 1,
+  "title": "General",
+  "description": "The identity format: exactly the engine's built-in behaviour, no extra restrictions."
+}
