@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "format_id": "smme_finance",
+  "format_version": 1,
+  "title": "SMME finance",
+  "description": "Stricter format for small-business finance: a human approves every mission, evidence must be substantial, payment topics escalate.",
+  "persona": {
+    "researcher": "You support a small business owner in South Africa. Prefer plain language and rand (ZAR) figures where relevant.",
+    "analyst": "Summarise for a busy owner-manager: short, practical, and clear about uncertainty.",
+    "creator": "Write a brief, plain-language note suitable for an owner-manager."
+  },
+  "risk": {
+    "floor": "medium",
+    "triggers": [
+      { "id": "payments", "where": "objective", "contains": "payment", "tier": "high" },
+      { "id": "bank_details", "where": "claim", "contains": "bank account", "tier": "high" },
+      { "id": "tax_advice", "where": "artifact", "contains": "tax advice", "tier": "high" }
+    ],
+    "mission_types": [
+      { "id": "cashflow_review", "label": "Cash-flow review", "floor": "medium" },
+      { "id": "supplier_payment", "label": "Supplier payment", "floor": "high" }
+    ]
+  },
+  "approval": { "human_required_for_all": true },
+  "evidence": { "min_claims": 1, "min_snippet_chars": 20, "source_domains": ["raw.githubusercontent.com"] },
+  "critic": { "max_artifact_chars": 4000, "forbidden_terms": ["guaranteed returns"] },
+  "limits": { "objective_max_chars": 1000 }
+}
