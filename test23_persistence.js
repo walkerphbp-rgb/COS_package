@@ -119,7 +119,7 @@ const expectRefusal = async (env, code) => { const b = boot(env); const r = awai
     let h = (await req(b.P, 'GET', '/health')).json;
     check('23B-2 /health: resolved path, root, REQUIRE, guard pass, inside root, dir writable', h.persistence.db_path === dbp && h.persistence.persistent_root === disk && h.persistence.require_persistent === true && h.persistence.guard === 'pass' && h.persistence.db_path_inside_root === true && h.persistence.db_dir_writable === true && h.persistence.db_file_exists === true && h.persistence.using_persistent_location === true, JSON.stringify(h.persistence));
     check('23B-3 /health: db.guards ok, journal_mode=wal, busy_timeout reported', h.db.guards.ok === true && h.db.journal_mode === 'wal' && h.db.busy_timeout_ms === 5000, JSON.stringify(h.db));
-    check('23B-4 /health: schema user_version == expected (1) and migration summary present', h.db.schema.user_version === 1 && h.db.schema.expected === 1 && h.db.schema.ok === true && h.db.schema.migration.ran === true, JSON.stringify(h.db.schema));
+    check('23B-4 /health: schema user_version == expected (2 = formats, FORMAT_SPECIFICATION 5.1) and migration summary present', h.db.schema.user_version === 2 && h.db.schema.expected === 2 && h.db.schema.ok === true && h.db.schema.migration.ran === true, JSON.stringify(h.db.schema));
     check('23B-5 /health exposes no token or key material', !h.persistence || !JSON.stringify(h).includes(TOKEN) && !/api[_-]?key/i.test(JSON.stringify(h)));
     check('23B-6 init result is created on first boot', h.init.result === 'created', h.init.result);
 
@@ -140,7 +140,7 @@ const expectRefusal = async (env, code) => { const b = boot(env); const r = awai
       check('23C-4 after a clean stop any -wal/-shm file is beside the DB on the disk (none elsewhere)', stray.every(f => path.dirname(f) === disk), stray.join(',')); }
     b = boot(penv); check('23C-5 restart on the same disk with COS_INIT_DB=1 boots', await b.up(), b.log.slice(-300));
     h = (await req(b.P, 'GET', '/health')).json;
-    check('23C-6 after restart: init not_needed (existing DB untouched), guard pass, journal wal, version 1', h.init.result === 'not_needed' && h.persistence.guard === 'pass' && h.db.journal_mode === 'wal' && h.db.schema.user_version === 1 && h.db.guards.ok, JSON.stringify({ i: h.init, g: h.persistence.guard, d: h.db.schema }));
+    check('23C-6 after restart: init not_needed (existing DB untouched), guard pass, journal wal, version 2', h.init.result === 'not_needed' && h.persistence.guard === 'pass' && h.db.journal_mode === 'wal' && h.db.schema.user_version === 2 && h.db.guards.ok, JSON.stringify({ i: h.init, g: h.persistence.guard, d: h.db.schema }));
     let s2 = (await req(b.P, 'GET', '/api/snapshot')).json;
     const rows2 = new DatabaseSync(dbp).prepare(`SELECT status FROM decisions WHERE mission_id='M_ONE' ORDER BY id`).all().map(r => r.status).join(',');
     check('23C-7 FRESH READ after SIGTERM restart: same mission, marker, decisions, audit', s2.missions.some(m => m.id === 'M_ONE') && JSON.stringify(s2).includes(MARK) && rows2 === rows1 && countAudit(s2, 'M_ONE') === countAudit(s1, 'M_ONE'), `${rows1} | ${rows2}`);
@@ -160,9 +160,9 @@ const expectRefusal = async (env, code) => { const b = boot(env); const r = awai
       let bb = boot({ COS_DB_PATH: dp, COS_INIT_DB: '0' }); const up = await bb.up(); const hh = up ? (await req(bb.P, 'GET', '/health')).json : null;
       bb.child.kill('SIGTERM'); await bb.done;
       const v = new DatabaseSync(dp);
-      check('23D-1 unversioned existing DB: boots, stamped v0 -> v1, existing rows byte-identical, guards applied', up && hh.db.schema.user_version === 1 && hh.db.guards.ok && JSON.stringify(v.prepare('SELECT * FROM decisions').all()) === before, bb.log.slice(-300));
+      check('23D-1 unversioned existing DB: boots, stamped v0 -> v2, existing rows byte-identical, old missions get NULL format columns, guards applied', up && hh.db.schema.user_version === 2 && hh.db.guards.ok && JSON.stringify(v.prepare('SELECT * FROM decisions').all()) === before && v.prepare(`SELECT COUNT(*) c FROM missions WHERE id = 'OLD' AND format_id IS NULL AND format_version IS NULL AND manifest_hash IS NULL`).get().c === 1, bb.log.slice(-300));
       bb = boot({ COS_DB_PATH: dp, COS_INIT_DB: '0' }); await bb.up(); const h2 = (await req(bb.P, 'GET', '/health')).json; bb.child.kill('SIGTERM'); await bb.done;
-      check('23D-2 second boot is idempotent: nothing applied, version stays 1', h2.db.schema.migration.applied === 0 && h2.db.schema.migration.version_before === 1 && h2.db.schema.user_version === 1, JSON.stringify(h2.db.schema.migration)); v.close(); }
+      check('23D-2 second boot is idempotent: nothing applied, version stays 2', h2.db.schema.migration.applied === 0 && h2.db.schema.migration.version_before === 2 && h2.db.schema.user_version === 2, JSON.stringify(h2.db.schema.migration)); v.close(); }
     { const dp = path.join(mk('D2'), 'new.db'); const d = new DatabaseSync(dp); d.exec(schema); d.exec('PRAGMA user_version = 99'); d.close();
       const x = await expectRefusal({ COS_DB_PATH: dp, COS_INIT_DB: '0' });
       check('23D-3 DB stamped with a NEWER schema version: refuses to boot (exit 4), data untouched', x.r && x.r.code === 4 && !x.listening && /newer than this build/.test(x.log) && Number(Object.values(new DatabaseSync(dp).prepare('PRAGMA user_version').get())[0]) === 99, JSON.stringify(x.r) + x.log.slice(-200)); }

@@ -1,9 +1,9 @@
 # Chief of Staff — Format Specification (v1)
 
-**Status: DESIGN ONLY.** Nothing in this document is implemented. No loader, schema change or gate change exists yet.
+**Status: IMPLEMENTED LOCALLY (Test 26, 117 checks). LIVE-VALIDATION PENDING.** The loader, schema v2, gate rule, mission-chain hooks, Decision Memory fields and boot checks exist and pass local tests. Nothing has been run on Render yet. See "Implementation notes" at the end for the interpretations made while building.
 Status labels used here: 🟢 PROVEN (already tested in the repo) · 🔵 DESIGN (specified, not built) · 🔴 FUTURE (explicitly out of v1).
 
-Approved in principle by the owner; implementation is blocked until the decisions in §12 are signed off.
+Approved by the owner. Decisions D1–D4 were accepted as the recommended defaults.
 
 ---
 
@@ -92,6 +92,8 @@ Only the values above are in v1. `min_distinct_sources` is deliberately absent: 
 **4.3 Matching.** Literal, case-insensitive substring matching only. No regular expressions (rules out ReDoS), bounded list sizes, bounded lengths.
 
 **4.4 Monotonicity guarantee (the property Test 26 enforces).** For every fixture mission, running under *any valid format* yields an outcome that is **at least as strict** as `general` on three measures: final risk tier, whether a human approval is required, and whether the mission proceeds to execution. A format can never produce a more permissive outcome than `general` for the same input.
+
+*Clarification found during implementation:* a mission refused before any model call (a `source_domains` refusal) never reaches classification, so it has no meaningful final tier. For such missions the measure is that they **can never execute**, even if someone later records a forged human approval (the gate requires a preceding AWAITING_APPROVAL, which a refused mission never has). Test 26E checks this.
 
 ---
 
@@ -199,3 +201,19 @@ Router and specialist selection · Ask/Assist/Delegate/Monitor/Mission task mode
 | D2 | Who selects a format? | **Operator chooses per mission**, limited by a deployment allowlist; the alternative is one pinned format per deployment |
 | D3 | Record policy effects in a `format_effects` table? | **Yes** (v2 adds 3 columns and 2 append-only tables); the alternative is encoding effects in decision text |
 | D4 | Keep multi-source evidence (`min_distinct_sources`) out of v1? | **Yes**, out until the engine can fetch more than one source |
+
+---
+
+## 13. Implementation notes (as built)
+
+Where building required an interpretation, it is recorded here so it can be reviewed.
+
+1. **`critic.required_payload_fields`:** the Creator's payload is free text, so a "field" is satisfied when the text contains a labelled line `<field>:` (optionally after `#`, `*`, `-` or `>`), or a JSON key `"<field>":`. Matching is case-insensitive and literal. *Owner to confirm this reading.*
+2. **`persona.critic` is accepted but has no effect in v1:** the Critic is deterministic code, not a model, so there is no prompt for it to join. A test proves it appears in no prompt.
+3. **`evidence.min_claims` above 1** is the only useful range today: the Researcher's validator already rejects a response with zero claims.
+4. **Boot behaviour:** formats are validated at every boot, including read-only mode (which validates but does not register). Any problem exits with code 5 and the server never listens.
+5. **Reason strings:** policy effects store stable codes (`floor_applied`, `trigger:<id>`, `min_claims_not_met`, `min_snippet_not_met`, `domain_refused`, `critic_check:<code>`, `human_required_for_all`, `format_bound`). Critic rationales carry only `format_checks_failed=<codes>`. No stored free text is used in any sentence the system writes.
+6. **Gate:** besides the new `human_required_for_all` refusal, the existing rule "a system approval is refused once a human gate was raised" already blocks forged approvals in the normal flow. The new rule matters for the case where no gate was raised; Test 26 (26G-2b, 26G-8) constructs exactly that case and includes a mutation check.
+7. **Dashboard:** unchanged. The format appears in Decision Memory (`getMission`, `explain`) and in the mission submission response.
+8. **Shipped formats:** `general` (identity) and `smme_finance` (example). `smme_finance` allows only `raw.githubusercontent.com` as a source host, so it refuses missions on any deployment whose seed URL is elsewhere; that is intended behaviour for the example.
+9. **Existing tests changed on purpose:** Test 23 now expects schema version 2 (four assertions); Test 25's dependency check (25A-4) now also allows the pure `format_canon.js`, with a new check (25A-4b) that this module is pure.

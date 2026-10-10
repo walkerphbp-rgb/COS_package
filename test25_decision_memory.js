@@ -125,7 +125,9 @@ function boot(env) {
     { const src = fs.readFileSync(path.join(__dirname, 'decision_memory.js'), 'utf8').split('\n').filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
       check('25A-3 source contains no write/DDL SQL', !/\b(INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|DROP\s+|ALTER\s+|CREATE\s+(TABLE|TRIGGER|INDEX)|REPLACE\s+INTO|VACUUM|journal_mode)/i.test(src));
       const reqs = [...src.matchAll(/require\('([^']+)'\)/g)].map(m => m[1]);
-      check('25A-4 requires only node:sqlite and ./mission_state: no provider, network, gate or mission_chain code', JSON.stringify(reqs.sort()) === JSON.stringify(['./mission_state', 'node:sqlite']) && !/fetch\(|https?\.|process\.env/.test(src), reqs.join()); }
+      check('25A-4 requires only node:sqlite, ./mission_state and ./format_canon: no provider, network, gate, loader or mission_chain code', JSON.stringify(reqs.sort()) === JSON.stringify(['./format_canon', './mission_state', 'node:sqlite']) && !/fetch\(|https?\.|process\.env/.test(src), reqs.join());
+      const canon = fs.readFileSync(path.join(__dirname, 'format_canon.js'), 'utf8').split('\n').filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+      check('25A-4b the one added dependency, format_canon.js, is pure: it requires only node:crypto and does no I/O', JSON.stringify([...canon.matchAll(/require\('([^']+)'\)/g)].map(m => m[1])) === JSON.stringify(['node:crypto']) && !/\bfs\b|fetch\(|https?\.|process\./.test(canon)); }
     check('25A-5 provider raw_output is never returned anywhere', !JSON.stringify([...NAMED.map(i => memory.getMission(mdb, i)), ...NAMED.map(i => memory.explain(mdb, i)), memory.search(mdb, { q: 'ee', limit: 100 })]).includes('RAW_OUTPUT_MUST_NEVER_LEAK'));
 
     // ---------------- 25B invariant vs snapshot ----------------

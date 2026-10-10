@@ -14,10 +14,12 @@
  *    says what is actually known about them (see LABELS). The words "true"/"fact" are never used as a label.
  *  - Free text is untrusted data: returned only as {untrusted:true, text, truncated, length}, control and
  *    bidi characters stripped, length-capped. Nothing here builds instruction text from stored text.
+ *  - Format provenance (v2): the bound format, its manifest hash re-verified on read, and the recorded policy effects.
  *  - Bounded: default 20 results, max 100; per-collection caps; provider raw_output is never read.
  *  - Status/approval/risk reasons come from mission_state.js, the same code the snapshot uses. */
 const { DatabaseSync } = require('node:sqlite');
 const { deriveMission, injected, R_INJECT, R_UNVERIFIED } = require('./mission_state');
+const { verifyStoredRow } = require('./format_canon');
 
 const MAX_TEXT = 500, SNIPPET = 200, DEFAULT_LIMIT = 20, MAX_LIMIT = 100, MAX_SCAN = 2000, MAX_ROWS = 200, CHUNK = 200;
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -150,6 +152,21 @@ function loadOne(db, id) {
   const execs = db.prepare('SELECT id, mission_id, detail, created_at FROM execution_log WHERE mission_id = ? ORDER BY id ASC').all(id);
   return { m, rows, recs, arts, fetches, execs, state: derive(m, rows) };
 }
+const hasTable = (db, name) => !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(name);
+/* The format a mission is bound to, with its stored manifest re-hashed on every read (tamper evidence). */
+function formatInfo(db, m) {
+  if (!m.manifest_hash) return { status: 'none', note: 'mission predates formats or was run without one' };
+  const base = { format_id: m.format_id, format_version: m.format_version, manifest_hash: m.manifest_hash };
+  let row = null; try { row = hasTable(db, 'format_manifests') ? db.prepare('SELECT * FROM format_manifests WHERE hash = ?').get(m.manifest_hash) : null; } catch { row = null; }
+  if (!row) return { ...base, status: 'manifest_missing' };
+  if (!verifyStoredRow(row)) return { ...base, status: 'hash_mismatch' };
+  const p = JSON.parse(row.effective_policy_json);
+  return { ...base, status: 'verified', policy: {
+    risk_floor: p.risk.floor, human_required_for_all: p.approval.human_required_for_all, min_claims: p.evidence.min_claims,
+    min_snippet_chars: p.evidence.min_snippet_chars, source_domains: p.evidence.source_domains, max_artifact_chars: p.critic.max_artifact_chars,
+    objective_max_chars: p.limits.objective_max_chars, trigger_ids: p.risk.triggers.map(t => t.id), mission_type_ids: p.risk.mission_types.map(t => t.id) } };
+}
+const loadEffects = (db, id) => (hasTable(db, 'format_effects') ? db.prepare('SELECT id, mission_id, effect_code, detail, created_at FROM format_effects WHERE mission_id = ? ORDER BY id ASC').all(id) : []);
 const claimAssurance = c => (c.poisoned || injected(c.text)) ? 'flagged_instruction_like' : c.fetch_match === 1 ? 'evidence_verified' : 'unverified';
 const cap = arr => ({ items: arr.slice(0, MAX_ROWS), total: arr.length, truncated: arr.length > MAX_ROWS });
 function parseIds(s) { try { const a = JSON.parse(s); return Array.isArray(a) ? a.filter(Number.isInteger).slice(0, 50) : []; } catch { return []; } }
@@ -173,6 +190,8 @@ function getMission(db, id) {
     execution: cap(execs.map(e => ({ kind: 'execution', assurance: 'recorded_action', provenance: prov('execution_log', e), detail: ut(e.detail) }))),
     provider_calls: cap((rows.calls[id] || []).map(c => ({ kind: 'provider_call', provenance: prov('provider_calls', c), specialist: c.specialist, provider_attempted: c.provider_attempted, provider_used: c.provider_used, fallback_triggered: c.fallback_triggered === 1, schema_valid: c.schema_valid === 1 }))),
     fetches: cap(fetches.map(f => ({ kind: 'fetch', provenance: prov('fetch_log', f), url: ut(f.url, 300), status_code: f.status_code, bytes: f.bytes, error: ut(f.error, 200) }))),
+    format: formatInfo(db, m),
+    format_effects: cap(loadEffects(db, id).map(f => ({ kind: 'format_effect', assurance: 'recorded_action', provenance: prov('format_effects', f), effect_code: f.effect_code, detail: ut(f.detail, 80) }))),
     labels: LABELS, notice: NOTICE,
   };
 }
@@ -212,6 +231,9 @@ function explain(db, id) {
   if (last && last.status === 'FAILED') gap('mission_failed', 'The mission ended in FAILED; no later decision exists.');
   if (state.status === 'AWAITING_APPROVAL') gap('awaiting_human_decision', 'The mission is waiting for a human decision.');
 
+  const fmt = formatInfo(db, m), effects = loadEffects(db, id);
+  if (fmt.status === 'manifest_missing' || fmt.status === 'hash_mismatch') gap('format_manifest_unverified', `The bound format manifest is ${fmt.status === 'hash_mismatch' ? 'present but fails its integrity check' : 'not stored'}.`);
+  if (fmt.status === 'verified' && fmt.policy.human_required_for_all && approvedRow && by && by.type !== 'human') gap('system_approval_despite_format_policy', 'The format requires human approval but the approval recorded is not human.');
   const narrative = [
     `Mission ${id} was created ${m.created_at} and is currently ${state.status} at risk tier ${state.risk_tier}.`,
     `Stored evidence: ${claims.length} claim(s): ${ver} evidence-verified, ${unver} unverified, ${flagged} flagged instruction-like.`,
@@ -219,6 +241,7 @@ function explain(db, id) {
     lastCritic ? `The Critic's latest stored verdict is ${lastCritic.verdict}.` : 'No Critic review is stored.',
     `Approval status: ${state.approval_status}${decided ? ` (recorded by ${by.type}${by.name ? ' ' + by.name : ''} at ${decided.created_at})` : ''}.`,
     execs.length ? `Execution: ${execs.length} execution record(s), first at ${execs[0].created_at}.` : 'Execution: no execution record.',
+    fmt.status === 'none' ? 'Format: none recorded for this mission.' : `Format ${fmt.format_id}@${fmt.format_version} (manifest ${fmt.status}); ${effects.length} policy effect(s) recorded${effects.length ? ': ' + [...new Set(effects.map(e => e.effect_code))].join(', ') : ''}.`,
   ];
   return {
     kind: 'explanation', mission_id: id, provenance: prov('missions', m),
@@ -230,6 +253,8 @@ function explain(db, id) {
     approval: { status: state.approval_status, decided_by: by, decision: decided ? prov('decisions', decided) : null },
     execution: { executed: execs.length > 0, count: execs.length, records: execs.slice(0, MAX_ROWS).map(e => prov('execution_log', e)) },
     timeline: decisions.slice(0, MAX_ROWS).map(x => ({ provenance: prov('decisions', x), status: x.status, actor: actorOf(x).type })),
+    format: fmt,
+    format_effects: effects.slice(0, MAX_ROWS).map(f => ({ provenance: prov('format_effects', f), effect_code: f.effect_code, detail: ut(f.detail, 80) })),
     gaps, narrative, labels: LABELS, notice: NOTICE,
   };
 }

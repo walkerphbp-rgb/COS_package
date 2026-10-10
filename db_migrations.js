@@ -33,11 +33,54 @@ function migrate(db) {
   return r;
 }
 
+/* ---- Schema v2 (formats; FORMAT_SPECIFICATION.md section 5.1). Additive and idempotent. ----
+ *  missions: 3 NULLABLE columns (older rows stay NULL = "pre-format")
+ *  format_manifests, format_effects: new APPEND-ONLY tables
+ *  trigger: a mission's format binding can never change after it is written */
+const V2_APPEND_ONLY = ['format_manifests', 'format_effects'];
+const V2_BINDING_TRIGGER = 'cos_missions_format_binding_immutable';
+function migrateV2(db) {
+  const r = { applied: [], warnings: [] };
+  const has = (type, name) => !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type=? AND name=?`).get(type, name);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const cols = db.prepare('PRAGMA table_info(missions)').all().map(c => c.name);
+    for (const [c, ty] of [['format_id', 'TEXT'], ['format_version', 'INTEGER'], ['manifest_hash', 'TEXT']])
+      if (!cols.includes(c)) { db.exec(`ALTER TABLE missions ADD COLUMN ${c} ${ty}`); r.applied.push(`missions.${c}`); }
+    if (!has('table', 'format_manifests')) {
+      db.exec(`CREATE TABLE format_manifests (hash TEXT PRIMARY KEY, format_id TEXT NOT NULL, format_version INTEGER NOT NULL,
+        manifest_json TEXT NOT NULL, effective_policy_json TEXT NOT NULL, registered_at TEXT NOT NULL, UNIQUE (format_id, format_version))`);
+      r.applied.push('format_manifests');
+    }
+    if (!has('table', 'format_effects')) {
+      db.exec(`CREATE TABLE format_effects (id INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL REFERENCES missions(id),
+        effect_code TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL)`);
+      r.applied.push('format_effects');
+    }
+    for (const t of V2_APPEND_ONLY) for (const op of ['UPDATE', 'DELETE']) {
+      const name = `cos_append_only_${t}_${op.toLowerCase()}`;
+      if (!has('trigger', name)) { db.exec(`CREATE TRIGGER ${name} BEFORE ${op} ON ${t} BEGIN SELECT RAISE(ABORT, 'append-only: ${op} on ${t} is not allowed'); END;`); r.applied.push(name); }
+    }
+    if (!has('trigger', V2_BINDING_TRIGGER)) {
+      db.exec(`CREATE TRIGGER ${V2_BINDING_TRIGGER} BEFORE UPDATE ON missions
+        WHEN OLD.format_id IS NOT NEW.format_id OR OLD.format_version IS NOT NEW.format_version OR OLD.manifest_hash IS NOT NEW.manifest_hash
+        BEGIN SELECT RAISE(ABORT, 'immutable: a mission''s format binding cannot change'); END;`);
+      r.applied.push(V2_BINDING_TRIGGER);
+    }
+    db.exec('COMMIT');
+  } catch (e) { try { db.exec('ROLLBACK'); } catch {} r.warnings.push(`schema v2 migration failed: ${e.message}`); }
+  return r;
+}
+
 /* Read-only check, for /health. */
 function guardStatus(db) {
   const want = [];
   for (const t of APPEND_ONLY) for (const op of ['update', 'delete']) want.push(['trigger', `cos_append_only_${t}_${op}`]);
   want.push(['index', 'cos_ux_execution_once']);
+  if (Number(Object.values(db.prepare('PRAGMA user_version').get())[0]) >= 2) {
+    for (const t of V2_APPEND_ONLY) for (const op of ['update', 'delete']) want.push(['trigger', `cos_append_only_${t}_${op}`]);
+    want.push(['trigger', V2_BINDING_TRIGGER]);
+  }
   const missing = want.filter(([ty, n]) => !db.prepare(`SELECT 1 FROM sqlite_master WHERE type=? AND name=?`).get(ty, n)).map(x => x[1]);
   return { ok: missing.length === 0, missing };
 }
@@ -45,10 +88,11 @@ function guardStatus(db) {
 /* ---- Schema versioning (PRAGMA user_version) ----
  * v0 = a DB that predates versioning (every DB created before this change, including production).
  * v1 = base test17 schema + the append-only guards from migrate(). Stamping v0 -> v1 changes no data.
+ * v2 = v1 + format binding (3 nullable missions columns, format_manifests, format_effects, their guards).
  * A DB stamped NEWER than this code understands is refused (an older build must not run on a newer
  * schema). A migration that throws, or that cannot create a required table/trigger, is FATAL.
  * A legacy-duplicate execution_log index skip stays non-fatal (documented in Test 21D-7). */
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const CORE_TABLES = ['missions', 'decisions', 'execution_log', 'critic_reviews'];
 
 function migrateVersioned(db) {
@@ -64,9 +108,14 @@ function migrateVersioned(db) {
     if (missing.length) { out.fatal = true; out.errors.push(`core table(s) missing: ${missing.join(', ')}; refusing to run on an incompatible schema`); out.version_after = out.version_before; return out; }
     out.report = migrate(db);
     if (out.report.warnings.length) { out.fatal = true; out.errors.push(...out.report.warnings); }
+    if (!out.fatal) {
+      const v2 = migrateV2(db);
+      out.report.applied.push(...v2.applied);
+      if (v2.warnings.length) { out.fatal = true; out.errors.push(...v2.warnings); }
+    }
     if (!out.fatal && out.version_before < SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     out.version_after = getV();
   } catch (e) { out.fatal = true; out.errors.push(`migration failed: ${e.message}`); }
   return out;
 }
-module.exports = { migrate, guardStatus, APPEND_ONLY, SCHEMA_VERSION, CORE_TABLES, migrateVersioned };
+module.exports = { migrate, migrateV2, guardStatus, APPEND_ONLY, V2_APPEND_ONLY, SCHEMA_VERSION, CORE_TABLES, migrateVersioned };

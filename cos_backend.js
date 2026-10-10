@@ -45,6 +45,9 @@
  *                        COS_PERSISTENT_ROOT (root exists, DB dir writable). Production:
  *                        COS_DB_PATH=/data/cos.db COS_PERSISTENT_ROOT=/data
  *   COS_PERSISTENT_ROOT  the directory the platform persists (e.g. a Render disk mount)
+ *   COS_FORMATS_DIR      directory of format manifests (default ./formats); invalid => refuse to boot (exit 5)
+ *   COS_DEFAULT_FORMAT   format used when a mission names none (default "general")
+ *   COS_ALLOWED_FORMATS  comma list of formats a mission may select (default: all loaded)
  *   COS_SHUTDOWN_GRACE_MS  SIGTERM/SIGINT drain window for in-flight requests (default 25000)
  *   PORT / COS_PORT      listen port. PORT (set by most hosts) wins, then
  *                        COS_PORT, then 8787.
@@ -98,6 +101,7 @@ const { guardStatus, migrateVersioned, SCHEMA_VERSION } = require('./db_migratio
 const persistence = require('./persistence');
 const { IN_PROGRESS, injected, deriveMission } = require('./mission_state');
 const memory = require('./decision_memory');
+const formatLoader = require('./format_loader');
 
 const PCFG = persistence.resolveConfig(process.env, __dirname);
 const DB_PATH = PCFG.dbPath;
@@ -378,6 +382,7 @@ function health(req, res) {
   const body = JSON.stringify({ ok: true, service: 'chief-of-staff-backend', version: VERSION, mode: MODE, read_only: READONLY,
     db: { present, readable, guards, journal_mode: journalMode, busy_timeout_ms: persistence.BUSY_TIMEOUT_MS,
       schema: { user_version: userVersion, expected: SCHEMA_VERSION, ok: userVersion === SCHEMA_VERSION, migration: MIGRATION_SUMMARY } },
+    formats: { schema_version: formatLoader.FORMAT_SCHEMA_VERSION, default: FORMAT_CFG.default, allowed: FORMAT_CFG.allowed, loaded: [...FORMATS.values()].map(f => ({ id: f.id, version: f.version, hash: f.hash })) },
     persistence: persistenceBlock, init: { enabled: INIT_DB, result: INIT_RESULT }, shutting_down: shuttingDown, time: nowISO() });
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', ...SEC });
   res.end(req.method === 'HEAD' ? undefined : body);
@@ -435,17 +440,20 @@ const server = http.createServer(async (req, res) => {
       let body; try { body = JSON.parse(await readBody(req) || '{}'); } catch { return send(res, 400, { ok: false, error: 'Invalid JSON' }); }
       const objective = typeof body.objective === 'string' ? body.objective.trim() : '';
       const nonce = typeof body.nonce === 'string' ? body.nonce.trim() : '';
-      if (objective.length < 10 || objective.length > 2000) return send(res, 400, { ok: false, error: 'objective must be 10-2000 characters' });
+      const sel = formatLoader.selectForRequest(FORMATS, FORMAT_CFG, { format_id: body.format_id, mission_type: body.mission_type });   // 400 if not available
+      const maxObjective = sel.format.effective.limits.objective_max_chars;
+      if (objective.length < 10 || objective.length > maxObjective) return send(res, 400, { ok: false, error: `objective must be 10-${maxObjective} characters` });
       if (!/^[A-Za-z0-9_-]{6,64}$/.test(nonce)) return send(res, 400, { ok: false, error: 'nonce is required: 6-64 chars, letters/digits/_/- only' });
       const db = open(true);
       try {
         const result = await runLiveMission(db, {
           requestText: objective, nonce, seedUrl: MISSION_SEED_URL,
+          format: { id: sel.format.id, version: sel.format.version, hash: sel.format.hash, policy: sel.format.effective, missionType: sel.missionType },
           keys: { gemini: GEMINI_API_KEY, groq: GROQ_API_KEY || null },
           models: MODELS,
         });
         logEvent(result.missionId, 'MISSION_SUBMITTED',
-          `by ${actor}, outcome=${result.outcome}, provider_used=${result.providerUsed}, nonce_verified=${result.nonceVerifiedInProviderResponse && result.nonceVerifiedInArtifact}`, actor);
+          `by ${actor}, format=${result.format.id}@${result.format.version}, outcome=${result.outcome}, provider_used=${result.providerUsed}, nonce_verified=${result.nonceVerifiedInProviderResponse && result.nonceVerifiedInArtifact}`, actor);
         return send(res, 201, { ok: true, ...result });
       } catch (e) {
         const failedId = (e && e.missionId) || null;
@@ -506,6 +514,21 @@ if (!READONLY && fs.existsSync(DB_PATH)) {
 } else if (READONLY && fs.existsSync(DB_PATH)) {
   try { const d = new DatabaseSync(DB_PATH); try { d.exec(`PRAGMA busy_timeout = ${persistence.BUSY_TIMEOUT_MS}`); } finally { d.close(); } } catch {}
 }
+/* ---------------- formats (FORMAT_SPECIFICATION.md). Invalid format files or selection config => REFUSE TO START. ---------------- */
+let FORMATS = null, FORMAT_CFG = null;
+try {
+  FORMATS = formatLoader.loadFormatsDir(process.env.COS_FORMATS_DIR ? path.resolve(process.env.COS_FORMATS_DIR) : path.join(__dirname, 'formats'));
+  FORMAT_CFG = formatLoader.selectionConfig(process.env, FORMATS);
+  if (!READONLY && fs.existsSync(DB_PATH)) {
+    const d = new DatabaseSync(DB_PATH);
+    try { d.exec(`PRAGMA busy_timeout = ${persistence.BUSY_TIMEOUT_MS}`); formatLoader.registerFormats(d, FORMATS); } finally { d.close(); }
+  }
+  console.log(`Formats: ${[...FORMATS.values()].map(f => `${f.id}@${f.version}`).join(', ')} | default=${FORMAT_CFG.default} allowed=${FORMAT_CFG.allowed.join(',')}`);
+} catch (e) {
+  console.error(`REFUSING TO START (format check failed): ${e.message}\nNothing was reset; fix the format file or COS_*_FORMAT settings.`);
+  process.exit(5);
+}
+
 const INIT_RESULT = !INIT_DB ? 'disabled' : initNote === null ? 'not_needed' : /^created/.test(initNote) ? 'created' : /ignored: COS_READONLY/.test(initNote) ? 'skipped' : 'failed';
 
 server.listen(PORT, HOST, () => {

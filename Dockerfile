@@ -12,7 +12,8 @@ FROM node:22-bookworm-slim
 # fails it exits instead of running as root. `docker run --user node ...` also works (chown is skipped).
 
 WORKDIR /app
-COPY cos_backend.js chief_of_staff_dashboard.html test17_schema.sql mission_chain.js provider_fallback.js gate.js db_migrations.js persistence.js docker-entrypoint.js mission_state.js decision_memory.js ./
+COPY cos_backend.js chief_of_staff_dashboard.html test17_schema.sql mission_chain.js provider_fallback.js gate.js db_migrations.js persistence.js docker-entrypoint.js mission_state.js decision_memory.js format_canon.js format_loader.js ./
+COPY formats ./formats/
 
 # /data is where the SQLite file lives. Mount a PERSISTENT VOLUME here or every redeploy starts empty.
 # The persistence REQUIREMENT is deliberately NOT baked into the image: set COS_REQUIRE_PERSISTENT=1 in the
