@@ -38,3 +38,5 @@ jobs:
         run: node test24_entrypoint.js
       - name: Run 25 (Decision Memory retrieval API)
         run: node test25_decision_memory.js
+      - name: Run 26 (formats, restrict-only policy)
+        run: node test26_formats.js
