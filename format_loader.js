@@ -26,6 +26,7 @@ const ENGINE_DEFAULTS = Object.freeze({
   evidence: { min_claims: 0, min_snippet_chars: 10, source_domains: [] },
   critic: { max_artifact_chars: null, forbidden_terms: [], required_payload_fields: [] },
   limits: { objective_max_chars: 2000 },
+  router: { max_mode: 'delegate' },
 });
 
 class FormatError extends Error { constructor(file, errors) { super(`${file}: ${errors.join('; ')}`); this.file = file; this.errors = errors; } }
@@ -94,7 +95,7 @@ function validateManifest(m) {
   };
   const int = (v, name, lo, hi) => { if (!Number.isInteger(v) || v < lo || v > hi) e(`${name} must be an integer ${lo}-${hi}`); };
   const list = (v, name, max) => { if (!Array.isArray(v)) { e(`${name} must be a list`); return false; } if (v.length > max) { e(`${name} may have at most ${max} entries`); return false; } return true; };
-  allow(m, ['schema_version', 'format_id', 'format_version', 'title', 'description', 'persona', 'risk', 'approval', 'evidence', 'critic', 'limits'], 'manifest');
+  allow(m, ['schema_version', 'format_id', 'format_version', 'title', 'description', 'persona', 'risk', 'approval', 'evidence', 'critic', 'limits', 'router'], 'manifest');
   if (m.schema_version !== FORMAT_SCHEMA_VERSION) e(`schema_version must be ${FORMAT_SCHEMA_VERSION}`);
   if (typeof m.format_id !== 'string' || !/^[a-z][a-z0-9_]{2,31}$/.test(m.format_id)) e('format_id must match [a-z][a-z0-9_]{2,31}');
   int(m.format_version, 'format_version', 1, 9999);
@@ -164,6 +165,12 @@ function validateManifest(m) {
       if (m.critic.required_payload_fields !== undefined && list(m.critic.required_payload_fields, 'critic.required_payload_fields', 10)) m.critic.required_payload_fields.forEach((t, k) => { if (typeof t !== 'string' || !/^[a-z_]{1,32}$/.test(t)) e(`critic.required_payload_fields[${k}] must match [a-z_]{1,32}`); });
     }
   }
+  if (m.router !== undefined) {
+    if (!isObj(m.router)) e('router must be an object'); else {
+      allow(m.router, ['max_mode'], 'router');
+      if (m.router.max_mode !== undefined && !['ask', 'assist', 'delegate'].includes(m.router.max_mode)) e('router.max_mode must be ask, assist or delegate');
+    }
+  }
   if (m.limits !== undefined) {
     if (!isObj(m.limits)) e('limits must be an object'); else {
       allow(m.limits, ['objective_max_chars'], 'limits');
@@ -196,6 +203,7 @@ function effectivePolicy(m) {
       forbidden_terms: [...new Set((c.forbidden_terms || []).map(lower))].sort(),
       required_payload_fields: [...new Set(c.required_payload_fields || [])].sort(),
     },
+    router: { max_mode: (m.router && m.router.max_mode) || D.router.max_mode },   // any enum value is <= the engine default (delegate), so it can only restrict
     limits: { objective_max_chars: Math.min(l.objective_max_chars ?? D.limits.objective_max_chars, D.limits.objective_max_chars) },
   };
 }

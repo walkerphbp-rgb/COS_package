@@ -23,12 +23,12 @@
 </head>
 <body>
 <h1>Chief of Staff — Format Live Check</h1>
-<p class="sub">Runs two real missions (general, smme_finance) plus negative requests against your deployed backend, then re-reads the evidence through Decision Memory.</p>
+<p class="sub">Runs real missions (general and smme_finance in delegate mode, plus an ask and an assist mission) and negative requests against your deployed backend, then re-reads the evidence through Decision Memory.</p>
 <div class="card">
   <label for="base">Backend URL</label><input id="base" value="https://cos-package.onrender.com" autocapitalize="off" autocorrect="off" spellcheck="false">
   <label for="tok">Operator token (kept only in this page; sent only to the URL above)</label><input id="tok" type="password" autocomplete="off">
   <button id="go">Run live format check</button>
-  <p class="small">Uses about 6 Gemini requests (3 per mission). A sleeping free instance can take up to a minute to wake.</p>
+  <p class="small">Uses about 11 Gemini requests (3 per delegate or assist mission, 2 for ask). A sleeping free instance can take up to a minute to wake.</p>
 </div>
 <div class="card"><div id="verdict">Not run yet.</div><div id="checks"></div></div>
 <div class="card"><button class="sec" id="copy" disabled>Copy result JSON</button><pre id="out"></pre></div>
@@ -58,22 +58,23 @@ async function runFormatCheck(cfg, deps) {
   if (h.status !== 200 || !h.json) { add('L1', 'INCONCLUSIVE', 'Backend reachable', h.error || `HTTP ${h.status}`); return finish(); }
   add('L1', 'PASS', 'Backend reachable', `version ${h.json.version}, mode ${h.json.mode}`);
   const H = h.json;
-  add('L2', H.db && H.db.schema && H.db.schema.user_version === 2 && H.db.schema.ok && H.db.guards && H.db.guards.ok ? 'PASS' : 'FAIL', 'Schema v2 and database guards OK', H.db && JSON.stringify({ v: H.db.schema && H.db.schema.user_version, guards: H.db.guards && H.db.guards.ok }));
+  add('L2', H.db && H.db.schema && H.db.schema.user_version === 3 && H.db.schema.ok && H.db.guards && H.db.guards.ok ? 'PASS' : 'FAIL', 'Schema v3 and database guards OK', H.db && JSON.stringify({ v: H.db.schema && H.db.schema.user_version, guards: H.db.guards && H.db.guards.ok }));
   const loaded = (H.formats && H.formats.loaded) || [], hashOf = id => (loaded.find(f => f.id === id) || {}).hash;
   add('L3', /^[0-9a-f]{64}$/.test(hashOf('general') || '') && /^[0-9a-f]{64}$/.test(hashOf('smme_finance') || '') ? 'PASS' : 'FAIL', 'Formats general and smme_finance are loaded with hashes', loaded.map(f => `${f.id}@${f.version}:${String(f.hash).slice(0, 12)}`).join(', '));
   add('L4', H.formats && H.formats.default === 'general' ? 'PASS' : 'FAIL', 'Default format is general', H.formats && H.formats.default);
+  add('L4b', H.router && H.router.default_mode === 'ask' && H.router.default_mode_elevated === false ? 'PASS' : 'FAIL', 'Router default mode is ask (not elevated)', H.router && JSON.stringify({ default: H.router.default_mode, elevated: H.router.default_mode_elevated }));
   data.hashes = { general: hashOf('general'), smme_finance: hashOf('smme_finance') };
 
   // ---- mission 1: no format named => general
   const obj = tag => `LIVE FORMAT CHECK ${tag} ${epoch}: In two sentences, explain what this SDK README is for.`;
-  const m1 = await api('POST', '/api/missions', { objective: obj('general'), nonce: nonce('G') });
+  const m1 = await api('POST', '/api/missions', { objective: obj('general'), nonce: nonce('G'), mode: 'delegate' });
   const id1 = m1.json && (m1.json.missionId || m1.json.mission_id);
   if (m1.status === 201 && m1.json.format) add('L5', m1.json.format.id === 'general' && m1.json.format.hash === hashOf('general') ? 'PASS' : 'FAIL', 'Mission with no format_id runs under "general" (bound hash equals /health)', `${m1.json.outcome}, tier ${m1.json.riskTier}`);
   else add('L5', 'INCONCLUSIVE', 'Mission with no format_id runs under "general"', `HTTP ${m1.status} ${m1.error || (m1.json && m1.json.error) || ''}`);
   data.general_mission = id1 || null;
 
   // ---- mission 2: smme_finance
-  const m2 = await api('POST', '/api/missions', { objective: obj('smme'), nonce: nonce('S'), format_id: 'smme_finance', mission_type: 'cashflow_review' });
+  const m2 = await api('POST', '/api/missions', { objective: obj('smme'), nonce: nonce('S'), mode: 'delegate', format_id: 'smme_finance', mission_type: 'cashflow_review' });
   const id2 = m2.json && (m2.json.missionId || m2.json.mission_id);
   const refusal = m2.status === 502 && m2.json && /not allowed by this format/.test(m2.json.error || '');
   if (m2.status === 201) add('L6', m2.json.outcome === 'AWAITING_APPROVAL' && !/^LOW$/i.test(m2.json.riskTier) && m2.json.format && m2.json.format.id === 'smme_finance' && m2.json.format.hash === hashOf('smme_finance') ? 'PASS' : 'FAIL', 'smme_finance mission is held for a human at tier medium or higher (never auto-completed)', `${m2.json.outcome}, tier ${m2.json.riskTier}`);
@@ -82,8 +83,25 @@ async function runFormatCheck(cfg, deps) {
   data.smme_mission = id2 || null; data.smme_refusal_path = !!refusal;
 
   // ---- negative requests (no model calls expected)
-  const neg = [await api('POST', '/api/missions', { objective: obj('neg1'), nonce: nonce('N1'), format_id: 'nope_x' }), await api('POST', '/api/missions', { objective: obj('neg2'), nonce: nonce('N2'), mission_type: 'cashflow_review' }), await api('POST', '/api/missions', { objective: 'x'.repeat(1500), nonce: nonce('N3'), format_id: 'smme_finance' })];
-  add('L7', neg.every(n => n.status === 400) ? 'PASS' : 'FAIL', 'Unknown format, mission_type not defined by the format, and an over-long objective under smme_finance are all refused with 400', neg.map(n => n.status).join(', '));
+  const neg = [await api('POST', '/api/missions', { objective: obj('neg1'), nonce: nonce('N1'), mode: 'delegate', format_id: 'nope_x' }), await api('POST', '/api/missions', { objective: obj('neg2'), nonce: nonce('N2'), mode: 'delegate', mission_type: 'cashflow_review' }), await api('POST', '/api/missions', { objective: 'x'.repeat(1500), nonce: nonce('N3'), mode: 'delegate', format_id: 'smme_finance' }),
+    await api('POST', '/api/missions', { objective: obj('neg4'), nonce: nonce('N4'), mode: 'DELEGATE' }), await api('POST', '/api/missions', { objective: obj('neg5'), nonce: nonce('N5'), mode: 'admin' })];
+  add('L7', neg.every(n => n.status === 400) ? 'PASS' : 'FAIL', 'Unknown format, undefined mission_type, an over-long objective under smme_finance, and invalid modes ("DELEGATE", "admin") are all refused with 400', neg.map(n => n.status).join(', '));
+
+  // ---- Router: ask and assist missions never execute
+  const ma = await api('POST', '/api/missions', { objective: obj('ask'), nonce: nonce('A'), mode: 'ask' }), mt = await api('POST', '/api/missions', { objective: obj('assist'), nonce: nonce('T'), mode: 'assist' });
+  const ida = ma.json && (ma.json.missionId || ma.json.mission_id), idt = mt.json && (mt.json.missionId || mt.json.mission_id);
+  if (ma.status === 201) add('L11', ma.json.outcome === 'ANSWERED' && ma.json.mode === 'ask' && ma.json.criticVerdict === null ? 'PASS' : 'FAIL', 'Ask mission ends ANSWERED (research + analysis only: no artifact, no Critic, nothing to approve or execute)', `${ma.json.outcome}, mode ${ma.json.mode}`);
+  else add('L11', 'INCONCLUSIVE', 'Ask mission', `HTTP ${ma.status} ${ma.error || (ma.json && ma.json.error) || ''}`);
+  if (mt.status === 201) add('L12', mt.json.outcome === 'DRAFT_READY' && mt.json.mode === 'assist' ? 'PASS' : 'FAIL', 'Assist mission ends DRAFT_READY (drafted and Critic-reviewed, held; nothing to approve or execute)', `${mt.json.outcome}, mode ${mt.json.mode}, critic ${mt.json.criticVerdict}`);
+  else add('L12', 'INCONCLUSIVE', 'Assist mission', `HTTP ${mt.status} ${mt.error || (mt.json && mt.json.error) || ''}`);
+  for (const [lab, id, st, md] of [['L11a', ida, 'ANSWERED', 'ask'], ['L12a', idt, 'DRAFT_READY', 'assist']]) {
+    if (!id) continue;
+    const e = await api('GET', `/api/memory/missions/${id}/explain`);
+    if (e.status !== 200 || !e.json) { add(lab, 'INCONCLUSIVE', `explain (${md})`, `HTTP ${e.status}`); continue; }
+    const x = e.json;
+    add(lab, x.status === st && x.router && x.router.status === 'consistent' && x.router.mode === md && x.execution && x.execution.executed === false && x.approval && x.approval.status === 'NOT REQUIRED' ? 'PASS' : 'FAIL', `explain (${md}): routing decision recorded and consistent, status ${st}, no approval needed, nothing executed`, `${x.status}; router ${x.router && x.router.status}; ${(x.narrative || []).find(n => /^Routing/.test(n)) || ''}`);
+    data['explain_' + md] = { status: x.status, router: x.router && { mode: x.router.mode, plan: x.router.plan_id, status: x.router.status }, executed: x.execution && x.execution.executed, approval: x.approval && x.approval.status };
+  }
 
   // ---- re-read the evidence through Decision Memory
   async function explainChecks(label, id, fmtId, expectAwaiting) {

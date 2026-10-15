@@ -166,6 +166,14 @@ function formatInfo(db, m) {
     min_snippet_chars: p.evidence.min_snippet_chars, source_domains: p.evidence.source_domains, max_artifact_chars: p.critic.max_artifact_chars,
     objective_max_chars: p.limits.objective_max_chars, trigger_ids: p.risk.triggers.map(t => t.id), mission_type_ids: p.risk.mission_types.map(t => t.id) } };
 }
+const loadRouter = (db, id) => (hasTable(db, 'router_decisions') ? db.prepare('SELECT * FROM router_decisions WHERE mission_id = ?').get(id) || null : null);
+function routerInfo(m, rd) {
+  if (m.mode === undefined || m.mode === null) return { status: 'none', note: 'mission predates routing (schema v3)' };
+  const base = { mode: m.mode, plan_id: m.plan_id, plan_version: m.plan_version };
+  if (!rd) return { ...base, status: 'decision_missing' };
+  const same = rd.effective_mode === m.mode && rd.plan_id === m.plan_id && rd.plan_version === m.plan_version;
+  return { ...base, status: same ? 'consistent' : 'mismatch', requested_mode: rd.requested_mode, effective_mode: rd.effective_mode, restriction: rd.restriction, reason_code: rd.reason_code, provenance: prov('router_decisions', { ...rd, mission_id: rd.mission_id }) };
+}
 const loadEffects = (db, id) => (hasTable(db, 'format_effects') ? db.prepare('SELECT id, mission_id, effect_code, detail, created_at FROM format_effects WHERE mission_id = ? ORDER BY id ASC').all(id) : []);
 const claimAssurance = c => (c.poisoned || injected(c.text)) ? 'flagged_instruction_like' : c.fetch_match === 1 ? 'evidence_verified' : 'unverified';
 const cap = arr => ({ items: arr.slice(0, MAX_ROWS), total: arr.length, truncated: arr.length > MAX_ROWS });
@@ -191,6 +199,7 @@ function getMission(db, id) {
     provider_calls: cap((rows.calls[id] || []).map(c => ({ kind: 'provider_call', provenance: prov('provider_calls', c), specialist: c.specialist, provider_attempted: c.provider_attempted, provider_used: c.provider_used, fallback_triggered: c.fallback_triggered === 1, schema_valid: c.schema_valid === 1 }))),
     fetches: cap(fetches.map(f => ({ kind: 'fetch', provenance: prov('fetch_log', f), url: ut(f.url, 300), status_code: f.status_code, bytes: f.bytes, error: ut(f.error, 200) }))),
     format: formatInfo(db, m),
+    router: routerInfo(m, loadRouter(db, id)),
     format_effects: cap(loadEffects(db, id).map(f => ({ kind: 'format_effect', assurance: 'recorded_action', provenance: prov('format_effects', f), effect_code: f.effect_code, detail: ut(f.detail, 80) }))),
     labels: LABELS, notice: NOTICE,
   };
@@ -231,7 +240,13 @@ function explain(db, id) {
   if (last && last.status === 'FAILED') gap('mission_failed', 'The mission ended in FAILED; no later decision exists.');
   if (state.status === 'AWAITING_APPROVAL') gap('awaiting_human_decision', 'The mission is waiting for a human decision.');
 
-  const fmt = formatInfo(db, m), effects = loadEffects(db, id);
+  const fmt = formatInfo(db, m), effects = loadEffects(db, id), rt = routerInfo(m, loadRouter(db, id));
+  if (m.mode !== undefined && m.mode !== null) {
+    if (rt.status === 'decision_missing') gap('router_decision_missing', 'The mission has a mode but no routing decision row.');
+    if (rt.status === 'mismatch') gap('router_record_mismatch', 'The mission\'s routing columns do not match its routing decision row.');
+    if (m.mode !== 'delegate' && execs.length) gap('execution_in_non_delegate_mission', 'Execution records exist for a mission whose mode does not permit execution.');
+    if (state.status === 'DRAFT_READY' && lastCritic && lastCritic.verdict !== 'PASS') gap('draft_flagged_by_critic', 'The draft was flagged by the Critic; review it before use.');
+  }
   if (fmt.status === 'manifest_missing' || fmt.status === 'hash_mismatch') gap('format_manifest_unverified', `The bound format manifest is ${fmt.status === 'hash_mismatch' ? 'present but fails its integrity check' : 'not stored'}.`);
   if (fmt.status === 'verified' && fmt.policy.human_required_for_all && approvedRow && by && by.type !== 'human') gap('system_approval_despite_format_policy', 'The format requires human approval but the approval recorded is not human.');
   const narrative = [
@@ -241,6 +256,7 @@ function explain(db, id) {
     lastCritic ? `The Critic's latest stored verdict is ${lastCritic.verdict}.` : 'No Critic review is stored.',
     `Approval status: ${state.approval_status}${decided ? ` (recorded by ${by.type}${by.name ? ' ' + by.name : ''} at ${decided.created_at})` : ''}.`,
     execs.length ? `Execution: ${execs.length} execution record(s), first at ${execs[0].created_at}.` : 'Execution: no execution record.',
+    rt.status === 'none' ? 'Routing: none recorded for this mission.' : `Routing: requested ${rt.requested_mode || '?'}, effective ${rt.mode}, plan ${rt.plan_id}@${rt.plan_version}${rt.restriction ? ', restricted by ' + rt.restriction : ''}.`,
     fmt.status === 'none' ? 'Format: none recorded for this mission.' : `Format ${fmt.format_id}@${fmt.format_version} (manifest ${fmt.status}); ${effects.length} policy effect(s) recorded${effects.length ? ': ' + [...new Set(effects.map(e => e.effect_code))].join(', ') : ''}.`,
   ];
   return {
@@ -254,6 +270,7 @@ function explain(db, id) {
     execution: { executed: execs.length > 0, count: execs.length, records: execs.slice(0, MAX_ROWS).map(e => prov('execution_log', e)) },
     timeline: decisions.slice(0, MAX_ROWS).map(x => ({ provenance: prov('decisions', x), status: x.status, actor: actorOf(x).type })),
     format: fmt,
+    router: rt,
     format_effects: effects.slice(0, MAX_ROWS).map(f => ({ provenance: prov('format_effects', f), effect_code: f.effect_code, detail: ut(f.detail, 80) })),
     gaps, narrative, labels: LABELS, notice: NOTICE,
   };

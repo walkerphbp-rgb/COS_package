@@ -425,13 +425,15 @@ const MSTATUS = {
   IN_PROGRESS:{cls:'info',g:'◆',label:'IN PROGRESS'}, PROPOSED:{cls:'info',g:'◆',label:'PROPOSED'},
   AWAITING_APPROVAL:{cls:'warn',g:'▲',label:'NEEDS APPROVAL'}, APPROVED:{cls:'info',g:'◆',label:'APPROVED'},
   EXECUTED:{cls:'info',g:'◆',label:'EXECUTED'}, COMPLETED:{cls:'ok',g:'✓',label:'COMPLETED'},
-  REJECTED:{cls:'mute',g:'✕',label:'REJECTED'}, BLOCKED:{cls:'bad',g:'■',label:'BLOCKED'}, FAILED:{cls:'bad',g:'■',label:'FAILED'}
+  REJECTED:{cls:'mute',g:'✕',label:'REJECTED'}, BLOCKED:{cls:'bad',g:'■',label:'BLOCKED'}, FAILED:{cls:'bad',g:'■',label:'FAILED'},
+  ANSWERED:{cls:'ok',g:'✓',label:'ANSWERED'}, DRAFT_READY:{cls:'ok',g:'✓',label:'DRAFT READY'}
 };
 const ACTIVE = new Set(['IN_PROGRESS','PROPOSED','AWAITING_APPROVAL','APPROVED','EXECUTED']);
 const AUDIT_LABEL = {
   PROPOSED:'Proposed', RESEARCH_STARTED:'Research started', RESEARCH_COMPLETED:'Research completed', GROUNDING_FAILED:'Grounding failed',
   RISK_CLASSIFIED:'Risk classified', PROVIDER_FALLBACK:'Provider fallback', APPROVAL_REQUESTED:'Approval requested', APPROVED:'Human approved',
-  REJECTED:'Human rejected', EXECUTED:'Executed', COMPLETED:'Completed', EXECUTION_BLOCKED:'Execution blocked', FAILED:'Execution failed'
+  REJECTED:'Human rejected', EXECUTED:'Executed', COMPLETED:'Completed', EXECUTION_BLOCKED:'Execution blocked', FAILED:'Execution failed',
+  ANSWERED:'Answered (no execution)', DRAFT_READY:'Draft ready (no execution)'
 };
 const riskOf = t => RISK[t] || RISK.UNKNOWN;
 const isHigh = t => t === 'HIGH' || !RISK[t];

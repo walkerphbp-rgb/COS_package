@@ -186,6 +186,7 @@ async function fetchGrounding(seedUrl) {
  *  4. the WHOLE snippet appears in the fetched content (whitespace-normalised on both sides),
  *     not just a prefix: a real opening followed by a fabricated tail fails */
 const { ENGINE_DEFAULTS, TIER_RANK } = require('./format_loader');
+const { planOf } = require('./router');
 const MIN_SNIPPET = ENGINE_DEFAULTS.evidence.min_snippet_chars;   // engine default; a format may only raise it
 const normWs = (s) => String(s || '').replace(/\s+/g, ' ').trim();
 function isGrounded(grounding, claim, seedUrl) {
@@ -352,15 +353,31 @@ function runCritic(db, { missionId, artifactId, claims, grounded, nonceInPayload
  *          route) can reply with something the phone can immediately check
  *          against a GET /api/snapshot read, without re-deriving anything.
  */
-async function runLiveMission(db, { requestText, nonce, seedUrl, keys, models, format }) {
+async function runLiveMission(db, { requestText, nonce, seedUrl, keys, models, format, route }) {
+  // FAIL CLOSED (ROUTER_SPECIFICATION section 4): an explicit routing decision is required. A forgotten argument can never
+  // run the full chain. Checked before anything is written.
+  let plan; try { plan = route ? planOf(route) : null; } catch { plan = null; }
+  if (!plan) throw new Error('runLiveMission requires an explicit, valid routing decision (route); refusing to run');
+  // The decision must be self-consistent: the plan belongs to the effective mode, and the effective mode never exceeds what was asked.
+  const RK = { ask: 0, assist: 1, delegate: 2 };
+  if (!(route.effective in RK) || !(route.requested in RK) || plan.mode !== route.effective || RK[plan.ceiling] > RK[route.effective] || RK[route.effective] > RK[route.requested])
+    throw new Error('routing decision is inconsistent (plan, effective mode and requested mode disagree); refusing to run');
   if (!keys || !keys.gemini) throw new Error('GEMINI_API_KEY is not configured on the server — cannot run a live mission');
   const missionId = uuid();
   const fx = makeFx(db, missionId, format);
-  if (format) db.prepare(`INSERT INTO missions (id, request_text, status, risk_tier, created_at, format_id, format_version, manifest_hash) VALUES (?, ?, 'PROPOSED', 'low', ?, ?, ?, ?)`)
-    .run(missionId, requestText, nowISO(), format.id, format.version, format.hash);
-  else db.prepare(`INSERT INTO missions (id, request_text, status, risk_tier, created_at) VALUES (?, ?, 'PROPOSED', 'low', ?)`)
-    .run(missionId, requestText, nowISO());
-  recordDecision(db, missionId, 'PROPOSED', requestText);
+  // Mission row + its single routing decision + the PROPOSED row are written ATOMICALLY: a crash leaves none of them.
+  db.exec('SAVEPOINT cos_mission_create');
+  try {
+    const created = nowISO();
+    if (format) db.prepare(`INSERT INTO missions (id, request_text, status, risk_tier, created_at, format_id, format_version, manifest_hash, mode, plan_id, plan_version) VALUES (?, ?, 'PROPOSED', 'low', ?, ?, ?, ?, ?, ?, ?)`)
+      .run(missionId, requestText, created, format.id, format.version, format.hash, route.effective, route.plan_id, route.plan_version);
+    else db.prepare(`INSERT INTO missions (id, request_text, status, risk_tier, created_at, mode, plan_id, plan_version) VALUES (?, ?, 'PROPOSED', 'low', ?, ?, ?, ?)`)
+      .run(missionId, requestText, created, route.effective, route.plan_id, route.plan_version);
+    db.prepare(`INSERT INTO router_decisions (mission_id, created_at, requested_mode, effective_mode, plan_id, plan_version, format_id, format_version, manifest_hash, restriction, reason_code) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(missionId, created, route.requested, route.effective, route.plan_id, route.plan_version, format ? format.id : null, format ? format.version : null, format ? format.hash : null, route.restriction, route.reason_code);
+    recordDecision(db, missionId, 'PROPOSED', requestText);
+    db.exec('RELEASE cos_mission_create');
+  } catch (e) { try { db.exec('ROLLBACK TO cos_mission_create'); db.exec('RELEASE cos_mission_create'); } catch {} throw e; }
 try {
   if (format) {   // restrict-only policy that applies before any model call
     fx.effect('format_bound', `${format.id}@${format.version}`);
@@ -381,6 +398,14 @@ try {
   }
   const analysis = await runAnalyst(db, { missionId, callSeq: 2, requestText, claimIds: research.claimIds, keys, models, persona: persona.analyst });
   if (format) fx.triggers('summary', [db.prepare('SELECT summary FROM recommendations WHERE id = ?').get(analysis.recommendationId).summary]);
+  const routed = { mode: route.effective, modeRequested: route.requested, restriction: route.restriction, plan: { id: plan.id, version: plan.version } };
+  if (plan.terminal === 'ANSWERED') {   // ask_v1: research + analysis only. No artifact, no Critic, nothing can execute.
+    const tier = db.prepare(`SELECT risk_tier FROM missions WHERE id = ?`).get(missionId).risk_tier;
+    recordDecision(db, missionId, 'ANSWERED', `plan=${plan.id} risk_tier=${tier}`);
+    return { missionId, riskTier: tier, criticVerdict: null, outcome: 'ANSWERED', format: format ? { id: format.id, version: format.version, hash: format.hash } : null, ...routed,
+      providerUsed: research.providerUsed, researcherProviderUsed: research.providerUsed, fallbackTriggered: research.fallbackTriggered || analysis.fallbackTriggered,
+      nonceVerifiedInProviderResponse: research.tokenVerified, nonceVerifiedInArtifact: null, claimCount: claims.length, tokenUsage: { researcher: research.usage, analyst: analysis.usage } };
+  }
   const creation = await runCreator(db, { missionId, callSeq: 3, requestText, nonce, recommendationId: analysis.recommendationId, keys, models, persona: persona.creator });
   let extraFailures = [];
   if (format) {
@@ -395,6 +420,13 @@ try {
   });
 
   const riskTier = db.prepare(`SELECT risk_tier FROM missions WHERE id = ?`).get(missionId).risk_tier;
+  if (plan.terminal === 'DRAFT_READY') {   // assist_v1: a drafted, Critic-reviewed artifact is held; nothing can execute.
+    recordDecision(db, missionId, 'DRAFT_READY', `plan=${plan.id} risk_tier=${riskTier} critic_verdict=${criticVerdict}`);
+    return { missionId, riskTier, criticVerdict, outcome: 'DRAFT_READY', format: format ? { id: format.id, version: format.version, hash: format.hash } : null, ...routed,
+      providerUsed: creation.fallbackTriggered ? 'groq' : research.providerUsed, researcherProviderUsed: research.providerUsed,
+      fallbackTriggered: research.fallbackTriggered || analysis.fallbackTriggered || creation.fallbackTriggered, nonceVerifiedInProviderResponse: research.tokenVerified,
+      nonceVerifiedInArtifact: creation.nonceInPayload, claimCount: claims.length, tokenUsage: { researcher: research.usage, analyst: analysis.usage, creator: creation.usage } };
+  }
   const forceHuman = fx.policy.approval.human_required_for_all;
   if (forceHuman) fx.effect('human_required_for_all');
   const autoEligible = riskTier === 'low' && criticVerdict === 'PASS' && !forceHuman;
@@ -425,6 +457,7 @@ try {
     criticVerdict,
     outcome,
     format: format ? { id: format.id, version: format.version, hash: format.hash } : null,
+    ...routed,
     providerUsed: creation.fallbackTriggered ? 'groq' : research.providerUsed,
     researcherProviderUsed: research.providerUsed,
     fallbackTriggered: research.fallbackTriggered || analysis.fallbackTriggered || creation.fallbackTriggered,

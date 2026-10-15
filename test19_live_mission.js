@@ -87,7 +87,7 @@ async function runGateA() {
 
   const postStart = nowISO();
   console.log(`\n[${postStart}] POST /api/missions ...`);
-  const post = await req('POST', '/api/missions', { objective: OBJECTIVE, nonce: NONCE });
+  const post = await req('POST', '/api/missions', { objective: OBJECTIVE, nonce: NONCE, mode: 'delegate' });
   const postEnd = nowISO();
   const callTimeWindow = { start: postStart, end: postEnd };
   console.log(`  status=${post.status}`);

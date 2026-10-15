@@ -23,6 +23,17 @@ function boundPolicy(db, missionId, refuse) {
   if (!verifyStoredRow(row)) refuse('is bound to a format manifest that fails its integrity check (fail closed)');
   return JSON.parse(row.effective_policy_json);
 }
+/* Routing binding (ROUTER_SPECIFICATION section 9). Read from the DATABASE. A mission whose stored mode is not
+ * "delegate" can never execute; if a mode is stored, the router_decisions row must exist and agree (fail closed).
+ * mode IS NULL = created before schema v3 = legacy behaviour, exactly as before. */
+function checkRouting(db, missionId, refuse) {
+  if (!db.prepare('PRAGMA table_info(missions)').all().some(c => c.name === 'mode')) return;
+  const m = db.prepare('SELECT mode, plan_id, plan_version FROM missions WHERE id = ?').get(missionId);
+  if (!m || m.mode === null) return;
+  if (m.mode !== 'delegate') refuse(`has mode "${String(m.mode).slice(0, 20)}", which does not permit execution`);
+  let d = null; try { d = db.prepare('SELECT effective_mode, plan_id, plan_version FROM router_decisions WHERE mission_id = ?').get(missionId); } catch { d = null; }
+  if (!d || d.effective_mode !== m.mode || d.plan_id !== m.plan_id || d.plan_version !== m.plan_version) refuse('routing record is missing or does not match the mission (fail closed)');
+}
 /* Core checks + writes. Caller MUST already hold an open transaction (BEGIN IMMEDIATE).
  * Two approval classes: HUMAN (must follow AWAITING_APPROVAL) and SYSTEM (deterministic low-risk
  * path: mission tier is low, critic verdicts all PASS, and NO human gate was ever raised). */
@@ -34,6 +45,7 @@ function gateExecuteInTx(db, missionId, ts) {
     if (db.prepare(`SELECT 1 FROM execution_log WHERE mission_id = ?`).get(missionId) ||
         db.prepare(`SELECT 1 FROM decisions WHERE mission_id = ? AND status IN ('EXECUTED','COMPLETED')`).get(missionId))
       refuse('already executed (exactly-once)');
+    checkRouting(db, missionId, refuse);
     const policy = boundPolicy(db, missionId, refuse);
     const ap = db.prepare(`SELECT id, rationale FROM decisions WHERE mission_id = ? AND status = 'APPROVED' ORDER BY id DESC LIMIT 1`).get(missionId);
     if (!ap) refuse('has no APPROVED decision row');

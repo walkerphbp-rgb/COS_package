@@ -18,7 +18,7 @@
 const fs = require('fs'), os = require('os'), path = require('path'), http = require('http');
 const { spawn } = require('child_process');
 const { DatabaseSync } = require('node:sqlite');
-const L = require('./format_loader'), C = require('./format_canon'), M = require('./db_migrations'), chain = require('./mission_chain'), gate = require('./gate'), memory = require('./decision_memory');
+const L = require('./format_loader'), C = require('./format_canon'), M = require('./db_migrations'), chain = require('./mission_chain'), gate = require('./gate'), memory = require('./decision_memory'), R = require('./router');
 
 let passed = 0, failed = 0;
 const check = (n, ok, d) => { if (ok) { passed++; console.log(`PASS  ${n}`); } else { failed++; console.log(`FAIL  ${n}${d ? '  -> ' + String(d).slice(0, 300) : ''}`); } };
@@ -54,7 +54,7 @@ async function run(fmt, o = {}) {
   const db = o.db || newDb(); L.registerFormats(db, new Map([[GENERAL.id, GENERAL], ...(fmt ? [[fmt.id, fmt]] : [])]));
   const bound = fmt ? { id: fmt.id, version: fmt.version, hash: fmt.hash, policy: fmt.effective, missionType: o.missionType || null } : undefined;
   let r = null, err = null;
-  try { r = await chain.runLiveMission(db, { requestText: o.objective || 'Summarise the SDK for the team', nonce: 'NONCE_T26' + (++uniq), seedUrl: o.seed || 'https://seed.test/doc', keys, models, format: bound }); } catch (e) { err = e; }
+  try { r = await chain.runLiveMission(db, { requestText: o.objective || 'Summarise the SDK for the team', nonce: 'NONCE_T26' + (++uniq), seedUrl: o.seed || 'https://seed.test/doc', keys, models, format: bound, route: R.route({ requested: o.mode || 'delegate', formatMaxMode: fmt ? fmt.effective.router.max_mode : 'delegate' }) }); } catch (e) { err = e; }
   const id = r ? r.missionId : err && err.missionId;
   const tier = id ? db.prepare('SELECT risk_tier t FROM missions WHERE id=?').get(id).t : null;
   const executed = id ? db.prepare('SELECT COUNT(*) c FROM execution_log WHERE mission_id=?').get(id).c > 0 : false;
@@ -136,7 +136,7 @@ const generalText = fs.readFileSync(path.join(__dirname, 'formats', 'general.jso
     // ================= 26D schema v2, registration =================
     { const v1 = new DatabaseSync(':memory:'); v1.exec(schema); v1.prepare(`INSERT INTO missions (id,request_text,created_at) VALUES ('OLD','legacy','t')`).run(); v1.prepare(`INSERT INTO decisions (mission_id,status,rationale,created_at) VALUES ('OLD','PROPOSED','r','t')`).run();
       const before = J(v1.prepare('SELECT * FROM decisions').all()); const r1 = M.migrateVersioned(v1), r2 = M.migrateVersioned(v1);
-      check('26D-1 v0/v1 -> v2 is additive: rows untouched, old missions get NULL format columns; second run applies nothing', !r1.fatal && r1.version_after === 2 && r2.report.applied.length === 0 && J(v1.prepare('SELECT * FROM decisions').all()) === before && v1.prepare(`SELECT COUNT(*) c FROM missions WHERE format_id IS NULL AND format_version IS NULL AND manifest_hash IS NULL`).get().c === 1);
+      check('26D-1 v0/v1 -> current schema is additive: rows untouched, old missions get NULL format columns; second run applies nothing', !r1.fatal && r1.version_after === 3 && r2.report.applied.length === 0 && J(v1.prepare('SELECT * FROM decisions').all()) === before && v1.prepare(`SELECT COUNT(*) c FROM missions WHERE format_id IS NULL AND format_version IS NULL AND manifest_hash IS NULL`).get().c === 1);
       const db = newDb(); L.registerFormats(db, new Map([['general', GENERAL]])); const n0 = db.prepare('SELECT COUNT(*) c FROM format_manifests').get().c; L.registerFormats(db, new Map([['general', GENERAL]]));
       check('26D-2 registration inserts once and is idempotent', n0 === 1 && db.prepare('SELECT COUNT(*) c FROM format_manifests').get().c === 1);
       const v1b = compile(base({ format_id: 'zz_fmt', risk: { floor: 'medium' } })), v1c = compile(base({ format_id: 'zz_fmt', risk: { floor: 'high' } })); L.registerFormats(db, new Map([['zz_fmt', v1b]]));
@@ -253,10 +253,10 @@ const generalText = fs.readFileSync(path.join(__dirname, 'formats', 'general.jso
     { const all = fdir({ 'general.json': generalText, 'smme_finance.json': fs.readFileSync(path.join(__dirname, 'formats', 'smme_finance.json'), 'utf8') });
       const dbp = path.join(tmp, 'srv.db'); const env = { COS_DB_PATH: dbp, COS_INIT_DB: '1', COS_FORMATS_DIR: all };
       const b = boot(env); const up = await b.up(); const h = up ? (await req(b.P, 'GET', '/health', null, false)).json : null;
-      check('26J-1 backend boots with formats: /health lists loaded formats with hashes, default and allowed; schema is v2', up && h.formats.default === 'general' && h.formats.loaded.length === 2 && h.formats.loaded.every(f => /^[0-9a-f]{64}$/.test(f.hash)) && h.db.schema.user_version === 2 && h.db.guards.ok, b.log.slice(-300));
+      check('26J-1 backend boots with formats: /health lists loaded formats with hashes, default and allowed; schema is v3', up && h.formats.default === 'general' && h.formats.loaded.length === 2 && h.formats.loaded.every(f => /^[0-9a-f]{64}$/.test(f.hash)) && h.db.schema.user_version === 3 && h.db.guards.ok, b.log.slice(-300));
       const reg = new DatabaseSync(dbp).prepare('SELECT format_id i, hash h FROM format_manifests ORDER BY format_id').all(); const loaded = L.loadFormatsDir(all);
       check('26J-2 boot registered every format with exactly the loader\'s hash', reg.length === 2 && reg.every(r => r.h === loaded.get(r.i).hash));
-      const post = (body) => req(b.P, 'POST', '/api/missions', { objective: 'Summarise the SDK for the team', nonce: 'NONCE_SRV' + (++uniq), ...body });
+      const post = (body) => req(b.P, 'POST', '/api/missions', { objective: 'Summarise the SDK for the team', nonce: 'NONCE_SRV' + (++uniq), mode: 'delegate', ...body });
       const r1 = await post({}); const ex = r1.status === 201 ? (await req(b.P, 'GET', `/api/memory/missions/${r1.json.missionId}/explain`)).json : null;
       check('26J-3 a mission with no format_id runs under "general": 201, response names the format, explain shows it verified', r1.status === 201 && r1.json.format.id === 'general' && r1.json.outcome === 'AUTO_COMPLETED' && ex && ex.format.status === 'verified' && ex.format.format_id === 'general', J(r1.json).slice(0, 200));
       const bad = await Promise.all([post({ format_id: 'nope_x' }), post({ format_id: '../etc' }), post({ mission_type: 'cashflow_review' }), post({ format_id: 'smme_finance', mission_type: 'nope' })]);
@@ -268,7 +268,7 @@ const generalText = fs.readFileSync(path.join(__dirname, 'formats', 'general.jso
       await b.stop();
       const b2 = boot(env); const up2 = await b2.up(); const h2 = up2 ? (await req(b2.P, 'GET', '/health', null, false)).json : null; const nReg = new DatabaseSync(dbp).prepare('SELECT COUNT(*) c FROM format_manifests').get().c; await b2.stop();
       check('26J-7 restart on the same database: formats re-validate, nothing re-registered or changed, earlier missions keep their binding', up2 && nReg === 2 && h2.formats.loaded.length === 2 && new DatabaseSync(dbp).prepare('SELECT manifest_hash h FROM missions WHERE id = ?').get(r1.json.missionId).h === loaded.get('general').hash);
-      const restricted = boot({ ...env, COS_DB_PATH: path.join(tmp, 'srv2.db'), COS_ALLOWED_FORMATS: 'general' }); await restricted.up(); const rr = await req(restricted.P, 'POST', '/api/missions', { objective: 'Summarise the SDK for the team', nonce: 'NONCE_SRVR1', format_id: 'smme_finance' }); await restricted.stop();
+      const restricted = boot({ ...env, COS_DB_PATH: path.join(tmp, 'srv2.db'), COS_ALLOWED_FORMATS: 'general' }); await restricted.up(); const rr = await req(restricted.P, 'POST', '/api/missions', { objective: 'Summarise the SDK for the team', nonce: 'NONCE_SRVR1', format_id: 'smme_finance', mode: 'delegate' }); await restricted.stop();
       check('26J-8 COS_ALLOWED_FORMATS restricts selection: a format outside the allowlist -> 400', rr.status === 400 && /not available/.test(rr.json.error));
       const x1 = await refusal({ ...env, COS_DB_PATH: path.join(tmp, 'r1.db'), COS_FORMATS_DIR: fdir({ 'general.json': generalText, 'weak_one.json': base({ format_id: 'weak_one', evidence: { min_snippet_chars: 3 } }) }) });
       check('26J-9 an invalid format file stops the server (exit 5): never listens, no fallback', x1.r && x1.r.code === 5 && !x1.listening && /weak_one\.json/.test(x1.log), J(x1.r) + x1.log.slice(-200));

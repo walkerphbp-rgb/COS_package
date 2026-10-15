@@ -3,6 +3,7 @@
  * creation, so the real state is the latest decisions row. Used by BOTH the dashboard snapshot
  * (cos_backend.js) and the Decision Memory API (decision_memory.js), so the two cannot disagree.
  * Pure functions: no I/O, no model calls. */
+const NON_EXECUTING_TERMINAL = new Set(['ANSWERED', 'DRAFT_READY']);   // Router: ask / assist plans end here; nothing can execute
 const IN_PROGRESS = new Set(['RESEARCHED', 'ANALYZED', 'ARTIFACT_DRAFTED', 'ARTIFACT_VERIFIED']);
 const INJECTION = [/ignore\s+(all\s+|previous\s+|prior\s+)?instructions/i, /pre[-\s]?approved/i,
   /set\s+risk_tier\s*=\s*low/i, /bypass\s+approval/i, /auto[-\s]?approve/i];
@@ -36,10 +37,11 @@ function deriveMission(m, d, cs, cl, cr, execCount) {
     provider_used: cs.length ? cs[cs.length - 1].provider_used : null,
     fallback_used: cs.some(c => c.fallback_triggered === 1),
     approval_status: approval,
-    execution_status: execCount ? 'COMPLETED' : (approval === 'REJECTED' ? 'NOT EXECUTED' : 'NOT STARTED'),
+    execution_status: execCount ? 'COMPLETED' : NON_EXECUTING_TERMINAL.has(st) ? 'NOT APPLICABLE' : (approval === 'REJECTED' ? 'NOT EXECUTED' : 'NOT STARTED'),
+    mode: m.mode === undefined ? null : m.mode, plan_id: m.plan_id === undefined ? null : m.plan_id,
     created_at: m.created_at, updated_at: last ? last.created_at : m.created_at,
     risk_reason: [...new Set(reasons)].join('; ') || (last && st === 'AWAITING_APPROVAL' ? last.rationale : ''),
     _reasons: [...new Set(reasons)],
   };
 }
-module.exports = { IN_PROGRESS, INJECTION, injected, deriveMission, R_INJECT, R_UNVERIFIED };
+module.exports = { NON_EXECUTING_TERMINAL, IN_PROGRESS, INJECTION, injected, deriveMission, R_INJECT, R_UNVERIFIED };

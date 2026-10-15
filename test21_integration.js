@@ -54,10 +54,12 @@ global.fetch = async (url, opts) => {
   return { ok: true, status: 200, json: async () => ({ candidates: [{ content: { parts: [{ text: JSON.stringify(out) }] } }], usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 } }) };
 };
 const chain = require('./mission_chain');
+const R = require('./router'), MV = require('./db_migrations').migrateVersioned;   // Router: runLiveMission needs an explicit route and schema v3
+const ROUTE = R.route({ requested: 'delegate', formatMaxMode: 'delegate' });
 const keys = { gemini: 'k' }, models = { gemini: 'm' };
 async function liveCase(dbPath, nonce) {
-  const db = new DatabaseSync(dbPath); db.exec(schema);
-  const r = await chain.runLiveMission(db, { requestText: 'task', nonce, seedUrl: 'https://seed.test/doc', keys, models });
+  const db = new DatabaseSync(dbPath); db.exec(schema); MV(db);
+  const r = await chain.runLiveMission(db, { requestText: 'task', nonce, seedUrl: 'https://seed.test/doc', keys, models, route: ROUTE });
   return { db, r };
 }
 (async () => {
@@ -71,9 +73,9 @@ async function liveCase(dbPath, nonce) {
     // fail-closed: make gate refuse by sabotaging the critic verdict path (tier forced non-low after critic, before approval is impossible), so use a mission whose critic is FLAG => AWAITING_APPROVAL already; instead stub gate refusal directly:
     const gate = require('./gate'); const orig = gate.gateExecuteInTx;
     // gate refusal injected via a DB trigger that blocks execution_log inserts
-    const p2 = path.join(tmp, 'b2.db'); const d2 = new DatabaseSync(p2); d2.exec(schema);
+    const p2 = path.join(tmp, 'b2.db'); const d2 = new DatabaseSync(p2); d2.exec(schema); MV(d2);
     d2.exec(`CREATE TRIGGER block_exec BEFORE INSERT ON execution_log BEGIN SELECT RAISE(ABORT,'BOUNDARY VIOLATION BLOCKED: injected'); END;`);
-    const r2 = await chain.runLiveMission(d2, { requestText: 'task', nonce: 'NONCE_DEF456', seedUrl: 'https://seed.test/doc', keys, models });
+    const r2 = await chain.runLiveMission(d2, { requestText: 'task', nonce: 'NONCE_DEF456', seedUrl: 'https://seed.test/doc', keys, models, route: ROUTE });
     const rows = d2.prepare(`SELECT status FROM decisions WHERE mission_id=? ORDER BY id`).all(r2.missionId).map(x => x.status);
     check('21B-3 gate refusal fails closed: AWAITING_APPROVAL, no APPROVED/EXECUTED left behind',
       r2.outcome === 'AWAITING_APPROVAL' && !rows.includes('APPROVED') && !rows.includes('EXECUTED') && rows[rows.length - 1] === 'AWAITING_APPROVAL', rows.join(','));

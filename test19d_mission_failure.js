@@ -91,7 +91,7 @@ function stop() { try { child.kill('SIGKILL'); } catch {} }
     if (!up) { stop(); return finish(1); }
 
     const r = await req('POST', '/api/missions', {
-      objective: 'Regression: provider outage mid-mission', nonce: 'REGR19D_NONCE_01' });
+      objective: 'Regression: provider outage mid-mission', nonce: 'REGR19D_NONCE_01', mode: 'delegate' });
     check('mission POST returns 502 on provider 503', r.status === 502, `status=${r.status} body=${r.raw.slice(0, 200)}`);
     check('error message reports the provider failure', r.json && /http 503/.test(r.json.error || ''), r.raw.slice(0, 200));
     const mid = r.json && r.json.mission_id;

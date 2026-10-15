@@ -72,6 +72,47 @@ function migrateV2(db) {
   return r;
 }
 
+/* ---- Schema v3 (Router; ROUTER_SPECIFICATION.md section 7). Additive and idempotent. ----
+ *  missions: 3 NULLABLE columns mode (the EFFECTIVE mode), plan_id, plan_version (NULL = created before v3)
+ *  router_decisions: append-only, UNIQUE(mission_id) => exactly one routing decision per mission, ever
+ *  triggers: routing binding immutable; no execution row can ever be written for an ask/assist mission */
+const V3_BINDING_TRIGGER = 'cos_missions_router_binding_immutable';
+const V3_EXEC_TRIGGER = 'cos_execution_requires_delegate';
+function migrateV3(db) {
+  const r = { applied: [], warnings: [] };
+  const has = (type, name) => !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type=? AND name=?`).get(type, name);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const cols = db.prepare('PRAGMA table_info(missions)').all().map(c => c.name);
+    for (const [c, ty] of [['mode', 'TEXT'], ['plan_id', 'TEXT'], ['plan_version', 'INTEGER']])
+      if (!cols.includes(c)) { db.exec(`ALTER TABLE missions ADD COLUMN ${c} ${ty}`); r.applied.push(`missions.${c}`); }
+    if (!has('table', 'router_decisions')) {
+      db.exec(`CREATE TABLE router_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL UNIQUE REFERENCES missions(id),
+        created_at TEXT NOT NULL, requested_mode TEXT NOT NULL, effective_mode TEXT NOT NULL, plan_id TEXT NOT NULL, plan_version INTEGER NOT NULL,
+        format_id TEXT, format_version INTEGER, manifest_hash TEXT, restriction TEXT, reason_code TEXT NOT NULL)`);
+      r.applied.push('router_decisions');
+    }
+    for (const op of ['UPDATE', 'DELETE']) {
+      const name = `cos_append_only_router_decisions_${op.toLowerCase()}`;
+      if (!has('trigger', name)) { db.exec(`CREATE TRIGGER ${name} BEFORE ${op} ON router_decisions BEGIN SELECT RAISE(ABORT, 'append-only: ${op} on router_decisions is not allowed'); END;`); r.applied.push(name); }
+    }
+    if (!has('trigger', V3_BINDING_TRIGGER)) {
+      db.exec(`CREATE TRIGGER ${V3_BINDING_TRIGGER} BEFORE UPDATE ON missions
+        WHEN OLD.mode IS NOT NEW.mode OR OLD.plan_id IS NOT NEW.plan_id OR OLD.plan_version IS NOT NEW.plan_version
+        BEGIN SELECT RAISE(ABORT, 'immutable: a mission''s routing binding cannot change'); END;`);
+      r.applied.push(V3_BINDING_TRIGGER);
+    }
+    if (!has('trigger', V3_EXEC_TRIGGER)) {
+      db.exec(`CREATE TRIGGER ${V3_EXEC_TRIGGER} BEFORE INSERT ON execution_log
+        WHEN (SELECT mode FROM missions WHERE id = NEW.mission_id) IN ('ask', 'assist')
+        BEGIN SELECT RAISE(ABORT, 'refused: the mission mode does not permit execution'); END;`);
+      r.applied.push(V3_EXEC_TRIGGER);
+    }
+    db.exec('COMMIT');
+  } catch (e) { try { db.exec('ROLLBACK'); } catch {} r.warnings.push(`schema v3 migration failed: ${e.message}`); }
+  return r;
+}
+
 /* Read-only check, for /health. */
 function guardStatus(db) {
   const want = [];
@@ -81,6 +122,10 @@ function guardStatus(db) {
     for (const t of V2_APPEND_ONLY) for (const op of ['update', 'delete']) want.push(['trigger', `cos_append_only_${t}_${op}`]);
     want.push(['trigger', V2_BINDING_TRIGGER]);
   }
+  if (Number(Object.values(db.prepare('PRAGMA user_version').get())[0]) >= 3) {
+    for (const op of ['update', 'delete']) want.push(['trigger', `cos_append_only_router_decisions_${op}`]);
+    want.push(['trigger', V3_BINDING_TRIGGER], ['trigger', V3_EXEC_TRIGGER]);
+  }
   const missing = want.filter(([ty, n]) => !db.prepare(`SELECT 1 FROM sqlite_master WHERE type=? AND name=?`).get(ty, n)).map(x => x[1]);
   return { ok: missing.length === 0, missing };
 }
@@ -88,11 +133,12 @@ function guardStatus(db) {
 /* ---- Schema versioning (PRAGMA user_version) ----
  * v0 = a DB that predates versioning (every DB created before this change, including production).
  * v1 = base test17 schema + the append-only guards from migrate(). Stamping v0 -> v1 changes no data.
+ * v3 = v2 + routing binding (mode/plan columns, router_decisions, execution guard).
  * v2 = v1 + format binding (3 nullable missions columns, format_manifests, format_effects, their guards).
  * A DB stamped NEWER than this code understands is refused (an older build must not run on a newer
  * schema). A migration that throws, or that cannot create a required table/trigger, is FATAL.
  * A legacy-duplicate execution_log index skip stays non-fatal (documented in Test 21D-7). */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const CORE_TABLES = ['missions', 'decisions', 'execution_log', 'critic_reviews'];
 
 function migrateVersioned(db) {
@@ -112,10 +158,11 @@ function migrateVersioned(db) {
       const v2 = migrateV2(db);
       out.report.applied.push(...v2.applied);
       if (v2.warnings.length) { out.fatal = true; out.errors.push(...v2.warnings); }
+      else { const v3 = migrateV3(db); out.report.applied.push(...v3.applied); if (v3.warnings.length) { out.fatal = true; out.errors.push(...v3.warnings); } }
     }
     if (!out.fatal && out.version_before < SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     out.version_after = getV();
   } catch (e) { out.fatal = true; out.errors.push(`migration failed: ${e.message}`); }
   return out;
 }
-module.exports = { migrate, migrateV2, guardStatus, APPEND_ONLY, V2_APPEND_ONLY, SCHEMA_VERSION, CORE_TABLES, migrateVersioned };
+module.exports = { migrate, migrateV2, migrateV3, guardStatus, APPEND_ONLY, V2_APPEND_ONLY, SCHEMA_VERSION, CORE_TABLES, migrateVersioned };
