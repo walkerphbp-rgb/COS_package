@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "format_id": "smme_finance",
-  "format_version": 1,
+  "format_version": 2,
   "title": "SMME finance",
   "description": "Stricter format for small-business finance: a human approves every mission, evidence must be substantial, payment topics escalate.",
   "persona": {
