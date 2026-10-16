@@ -63,6 +63,16 @@ const RAW = 'https://raw.githubusercontent.com/o/r/main/README.md';
       check('27-8 CAN FAIL/INCONCLUSIVE: if smme_finance is not selectable on the deployment, the verdict is not PASS', r.verdict !== 'PASS' && byId(r, 'L6').status === 'INCONCLUSIVE', r.verdict);
       await b.stop(); }
 
+    // ---- one network-level drop is retried once and counted; a persistent drop stays INCONCLUSIVE
+    { const b = boot({ COS_DB_PATH: path.join(tmp, 'd.db'), COS_MISSION_SEED_URL: RAW }); await b.up(); let dropped = 0;
+      const flaky = async (url, opts) => { if (!dropped && /\/api\/missions$/.test(url) && opts.method === 'POST' && /ask/.test(String(opts.body))) { dropped++; throw new TypeError('Failed to fetch'); } return fetch(url, opts); };
+      const r = await runFormatCheck({ base: b.url, token: TOKEN, epoch: '1760000007' }, { fetch: flaky, retryWaitMs: 50 });
+      check('27-10 a single dropped connection is retried once: verdict PASS, network_retries 1 (flakiness stays visible)', dropped === 1 && r.verdict === 'PASS' && r.data.network_retries === 1 && byId(r, 'L11').status === 'PASS', r.verdict + ' retries=' + r.data.network_retries);
+      const always = async (url, opts) => { if (/\/api\/missions$/.test(url) && opts.method === 'POST' && /LIVE FORMAT CHECK ask/.test(String(opts.body))) throw new TypeError('Failed to fetch'); return fetch(url, opts); };
+      const r2 = await runFormatCheck({ base: b.url, token: TOKEN, epoch: '1760000008' }, { fetch: always, retryWaitMs: 50 });
+      check('27-11 a drop that repeats after the retry is INCONCLUSIVE (never PASS), with both failures in the detail and the retry counted', r2.verdict === 'INCONCLUSIVE' && byId(r2, 'L11').status === 'INCONCLUSIVE' && /also failed once before/.test(byId(r2, 'L11').detail) && r2.data.network_retries >= 1, r2.verdict);
+      await b.stop(); }
+
     // ---- unreachable backend
     { const r = await runFormatCheck({ base: 'http://127.0.0.1:9', token: TOKEN, epoch: '1760000006' });
       check('27-9 an unreachable backend gives verdict INCONCLUSIVE with a clear L1, no exception', r.verdict === 'INCONCLUSIVE' && r.checks.length === 1 && byId(r, 'L1').status === 'INCONCLUSIVE'); }

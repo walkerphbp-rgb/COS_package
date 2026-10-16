@@ -28,6 +28,7 @@
   <label for="base">Backend URL</label><input id="base" value="https://cos-package.onrender.com" autocapitalize="off" autocorrect="off" spellcheck="false">
   <label for="tok">Operator token (kept only in this page; sent only to the URL above)</label><input id="tok" type="password" autocomplete="off">
   <button id="go">Run live format check</button>
+  <p class="small"><b>Keep this page open and in front, with the screen on, until it finishes (about 3 minutes).</b> If the phone sleeps or you switch apps, requests can be dropped.</p>
   <p class="small">Uses about 11 Gemini requests (3 per delegate or assist mission, 2 for ask). A sleeping free instance can take up to a minute to wake.</p>
 </div>
 <div class="card"><div id="verdict">Not run yet.</div><div id="checks"></div></div>
@@ -40,15 +41,23 @@
 async function runFormatCheck(cfg, deps) {
   const fetchFn = (deps && deps.fetch) || fetch, onCheck = (deps && deps.onCheck) || (() => {});
   const base = String(cfg.base || '').replace(/\/+$/, ''), token = String(cfg.token || ''), epoch = String(cfg.epoch || Date.now());
-  const checks = [], data = { started: new Date().toISOString(), base };
+  const checks = [], data = { started: new Date().toISOString(), base, network_retries: 0 };
   const add = (id, status, title, detail) => { const c = { id, status, title, detail: detail === undefined ? '' : String(detail).slice(0, 400) }; checks.push(c); onCheck(c); return c; };
-  async function api(method, path, body, timeoutMs) {
+  async function once(method, path, body, timeoutMs) {
     const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), timeoutMs || 120000);
     try {
       const r = await fetchFn(base + path, { method, signal: ctl.signal, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, body: body ? JSON.stringify(body) : undefined });
       let j = null; try { j = await r.json(); } catch {}
       return { status: r.status, json: j };
     } catch (e) { return { status: 0, json: null, error: String(e && e.message || e) }; } finally { clearTimeout(t); }
+  }
+  // A status-0 result means NO HTTP response arrived (dropped connection, phone suspended the page, proxy error without CORS headers).
+  // Retry once after a short pause; every retry is counted and shown, so flakiness stays visible instead of being hidden.
+  const retryWait = (deps && deps.retryWaitMs !== undefined) ? deps.retryWaitMs : 4000; let retries = 0;
+  async function api(method, path, body, timeoutMs) {
+    let r = await once(method, path, body, timeoutMs);
+    if (r.status === 0) { retries++; await new Promise(res => setTimeout(res, retryWait)); const first = r.error; r = await once(method, path, body, timeoutMs); r.retried = true; if (r.status === 0) r.error = `${r.error} (also failed once before: ${first})`; }
+    return r;
   }
   const has = (a, f) => Array.isArray(a) && a.some(f);
   const nonce = s => `LIVE_FORMAT_${epoch}_${s}`;
@@ -126,8 +135,9 @@ async function runFormatCheck(cfg, deps) {
   add('L10', ls.status === 200 && ids.every(i => has(ls.json.items, m => m.id === i)) && sr.status === 200 && ids.every(i => has(sr.json.items, h2 => h2.provenance.mission_id === i)) ? 'PASS' : (ids.length ? 'FAIL' : 'INCONCLUSIVE'), 'Both missions appear in the Decision Memory list and in a search for their request text', `list ${ls.status}, search ${sr.status}`);
 
   function finish() {
+    data.network_retries = retries;
     const fails = checks.filter(c => c.status === 'FAIL'), inc = checks.filter(c => c.status === 'INCONCLUSIVE'), notes = checks.filter(c => c.status === 'NOTE');
-    const verdict = fails.length ? 'FAIL' : inc.length ? 'INCONCLUSIVE' : notes.length ? 'PASS (refusal path only)' : 'PASS';
+    const verdict = fails.length ? 'FAIL' : inc.length ? 'INCONCLUSIVE' : notes.length ? 'PASS (refusal path only)' : 'PASS';   // network_retries > 0 with PASS means a dropped connection was retried once
     return { verdict, finished: new Date().toISOString(), counts: { pass: checks.filter(c => c.status === 'PASS').length, fail: fails.length, inconclusive: inc.length, note: notes.length }, checks, data };
   }
   return finish();
@@ -146,12 +156,16 @@ if (typeof document !== 'undefined') {
     t.append(a, d); r.append(ic, t); $('checks').append(r);
   }
   $('go').onclick = async () => {
+    let wl = null, hidden = 0; const onVis = () => { if (document.hidden) hidden++; }; document.addEventListener('visibilitychange', onVis);
+    try { if (navigator.wakeLock) wl = await navigator.wakeLock.request('screen'); } catch {}
     $('go').disabled = true; $('copy').disabled = true; $('checks').textContent = ''; $('out').textContent = ''; $('verdict').textContent = 'Running… (a sleeping instance can take a minute)';
     try {
       last = await runFormatCheck({ base: $('base').value.trim(), token: $('tok').value.trim() }, { onCheck: row });
+      last.data.page_hidden_events = hidden; last.data.screen_wake_lock = !!wl;
       $('verdict').textContent = 'Verdict: ' + last.verdict + `  (${last.counts.pass} pass, ${last.counts.fail} fail, ${last.counts.inconclusive} inconclusive)`;
       $('out').textContent = JSON.stringify(last, null, 2); $('copy').disabled = false;
     } catch (e) { $('verdict').textContent = 'Error: ' + (e && e.message || e); }
+    document.removeEventListener('visibilitychange', onVis); try { wl && wl.release(); } catch {}
     $('go').disabled = false;
   };
   $('copy').onclick = async () => { try { await navigator.clipboard.writeText($('out').textContent); $('copy').textContent = 'Copied'; } catch { $('copy').textContent = 'Select the text below and copy it'; } setTimeout(() => $('copy').textContent = 'Copy result JSON', 2500); };
