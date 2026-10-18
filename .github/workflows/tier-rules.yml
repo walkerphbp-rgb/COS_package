@@ -40,3 +40,9 @@ jobs:
         run: node test25_decision_memory.js
       - name: Run 26 (formats, restrict-only policy)
         run: node test26_formats.js
+      - name: Run 27 (live-check page logic)
+        run: node test27_format_runner.js
+      - name: Run 28 (router - modes, privilege, schema v3)
+        run: node test28_router.js
+      - name: Run 29 (B2 backup and recovery)
+        run: node test29_b2_backup.js
