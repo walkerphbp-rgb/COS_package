@@ -50,6 +50,10 @@
  *   COS_ALLOWED_FORMATS  comma list of formats a mission may select (default: all loaded)
  *   COS_DEFAULT_MODE     mode used when a mission names none: ask | assist | delegate (default "ask"; anything else
  *                        refuses to boot; a non-ask value is shown in /health as elevated)
+ *   COS_B2_BACKUP=1      OPT-IN off-site backup to Backblaze B2 (S3 API): verified snapshots + restore-if-the-local-DB-is-missing.
+ *                        Needs COS_B2_ENDPOINT, COS_B2_BUCKET, COS_B2_KEY_ID, COS_B2_APP_KEY (server-side env only);
+ *                        optional COS_B2_PREFIX, COS_B2_REGION, COS_B2_MIN_INTERVAL_SEC (15), COS_B2_KEEP (48). See B2_BACKUP.md.
+ *                        Unset = nothing changes. Any restore/config doubt refuses to boot (exit 7) instead of starting empty.
  *   COS_SHUTDOWN_GRACE_MS  SIGTERM/SIGINT drain window for in-flight requests (default 25000)
  *   PORT / COS_PORT      listen port. PORT (set by most hosts) wins, then
  *                        COS_PORT, then 8787.
@@ -387,6 +391,7 @@ function health(req, res) {
     db: { present, readable, guards, journal_mode: journalMode, busy_timeout_ms: persistence.BUSY_TIMEOUT_MS,
       schema: { user_version: userVersion, expected: SCHEMA_VERSION, ok: userVersion === SCHEMA_VERSION, migration: MIGRATION_SUMMARY } },
     formats: { schema_version: formatLoader.FORMAT_SCHEMA_VERSION, default: FORMAT_CFG.default, allowed: FORMAT_CFG.allowed, loaded: [...FORMATS.values()].map(f => ({ id: f.id, version: f.version, hash: f.hash })) },
+    backup: B2.manager ? B2.manager.status() : { enabled: false },
     router: { default_mode: DEFAULT_MODE, default_mode_elevated: DEFAULT_MODE !== 'ask', modes: router.MODES, plans: Object.values(router.PLANS).map(p => ({ id: p.id, version: p.version, mode: p.mode })) },
     persistence: persistenceBlock, init: { enabled: INIT_DB, result: INIT_RESULT }, shutting_down: shuttingDown, time: nowISO() });
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', ...SEC });
@@ -498,6 +503,15 @@ const server = http.createServer(async (req, res) => {
 });
 
 let initNote = null;
+/* ---------------- optional B2 restore (BEFORE the database is created or opened) ---------------- */
+const B2 = { boot: null, manager: null };
+if (process.env.COS_B2_BACKUP === '1' && !READONLY) {
+  const r = require('node:child_process').spawnSync(process.execPath, [path.join(__dirname, 'b2_boot.js')], { env: process.env, stdio: ['ignore', 'pipe', 'inherit'], encoding: 'utf8', timeout: 180000 });
+  const line = String(r.stdout || '').split('\n').find(l => l.startsWith('COS_B2_BOOT_RESULT '));
+  if (r.status !== 0 || !line) { console.error('REFUSING TO START (B2 backup/restore check failed): see the B2 messages above. Nothing was created or overwritten.'); process.exit(7); }
+  B2.boot = JSON.parse(line.slice('COS_B2_BOOT_RESULT '.length));
+} else if (process.env.COS_B2_BACKUP === '1') console.log('B2 backup: inactive in COS_READONLY mode');
+
 try { initNote = initDbIfRequested(); } catch (e) { initNote = 'DB init failed: ' + e.message; }
 // Summary for the public /health probe (counts only; the full detail stays in the console).
 let MIGRATION = { fatal: false, errors: [], report: null };
@@ -541,6 +555,13 @@ try {
 const INIT_RESULT = !INIT_DB ? 'disabled' : initNote === null ? 'not_needed' : /^created/.test(initNote) ? 'created' : /ignored: COS_READONLY/.test(initNote) ? 'skipped' : 'failed';
 
 server.listen(PORT, HOST, () => {
+  if (B2.boot && B2.boot.enabled) {
+    try {
+      const b2b = require('./b2_backup'), cfg = b2b.loadConfig(process.env);
+      B2.manager = new b2b.BackupManager({ cfg, dbPath: DB_PATH, s3: b2b.clientFor(cfg), maxSchema: SCHEMA_VERSION, lease: B2.boot.lease, restore: B2.boot.restore, log: m => console.error(m) });
+      B2.manager.start();
+    } catch (e) { console.error('B2 backup could not start: ' + String(e && e.message).slice(0, 200)); }
+  }
   console.log(`Chief of Staff backend v${VERSION} on http://${HOST}:${PORT}  (mode=${MODE}${READONLY ? ', READ-ONLY' : ''})`);
   console.log(`Persistence: require=${PCFG.requirePersistent} root=${PCFG.persistentRoot || '-'} guard=${PCFG.requirePersistent ? 'pass' : 'not_required'} (db path from ${PCFG.dbPathSource})`);
   console.log(`DB: ${DB_PATH}${fs.existsSync(DB_PATH) ? '' : '   <-- NOT FOUND yet (set COS_INIT_DB=1 to create an empty one)'}`);
@@ -563,9 +584,13 @@ function shutdown(sig) {
   server.close();
   try { server.closeIdleConnections(); } catch {}
   const started = Date.now();
-  const finish = () => {
+  const finish = async () => {
     const forced = inflight > 0;
     if (forced) console.error(`SHUTDOWN: grace expired with ${inflight} request(s) still running; exiting without recording anything on their behalf`);
+    if (B2.manager) {   // graceful stop: upload a final VERIFIED snapshot of anything not yet backed up (skipped if superseded)
+      try { const f = await B2.manager.flush(Math.max(2000, Math.min(12000, GRACE_MS - (Date.now() - started)))); console.log(`SHUTDOWN: B2 final snapshot ${f.flushed ? 'uploaded' : 'skipped (' + f.reason + ')'}`); B2.manager.stop(); }
+      catch (e) { console.error('SHUTDOWN: B2 final snapshot failed: ' + String(e && e.message).slice(0, 200)); }
+    }
     if (!READONLY && fs.existsSync(DB_PATH)) {
       try { const d = new DatabaseSync(DB_PATH); try { d.exec(`PRAGMA busy_timeout = ${persistence.BUSY_TIMEOUT_MS}`); d.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } finally { d.close(); } }
       catch (e) { console.error('SHUTDOWN: WAL checkpoint skipped: ' + e.message); }
@@ -573,6 +598,6 @@ function shutdown(sig) {
     console.log(`SHUTDOWN: ${forced ? 'forced' : 'clean'} after ${Date.now() - started}ms`);
     process.exit(forced ? 1 : 0);
   };
-  const t = setInterval(() => { try { server.closeIdleConnections(); } catch {} if (inflight === 0 || Date.now() - started >= GRACE_MS) { clearInterval(t); finish(); } }, 100);
+  const t = setInterval(() => { try { server.closeIdleConnections(); } catch {} if (inflight === 0 || Date.now() - started >= GRACE_MS) { clearInterval(t); finish().catch(() => process.exit(1)); } }, 100);
 }
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => shutdown(sig));
