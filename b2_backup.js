@@ -33,6 +33,9 @@ function loadConfig(env) {
   if (env.COS_B2_BACKUP !== '1') return { enabled: false };
   const need = ['COS_B2_ENDPOINT', 'COS_B2_BUCKET', 'COS_B2_KEY_ID', 'COS_B2_APP_KEY'], missing = need.filter(n => !env[n]);
   if (missing.length) throw new BackupConfigError(`COS_B2_BACKUP=1 but required environment variable(s) are not set: ${missing.join(', ')}`);
+  for (const n of [...need, 'COS_B2_PREFIX', 'COS_B2_REGION']) {   // a pasted space, newline or quote is the most common cause of a confusing 403
+    const v = env[n]; if (v !== undefined && v !== '' && (v !== v.trim() || /^["'`]|["'`]$/.test(v))) throw new BackupConfigError(`${n} has leading/trailing whitespace or quote characters; re-enter it without them`);
+  }
   let u; try { u = new URL(env.COS_B2_ENDPOINT); } catch { throw new BackupConfigError('COS_B2_ENDPOINT is not a valid URL'); }
   const loop = ['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname);
   if (u.protocol !== 'https:' && !(u.protocol === 'http:' && loop)) throw new BackupConfigError('COS_B2_ENDPOINT must be https (plain http is allowed only for a loopback test endpoint)');
@@ -68,10 +71,14 @@ function snapshotDb(dbPath, outFile) {
   try { d.exec('PRAGMA busy_timeout = 10000'); d.exec(`VACUUM INTO ${quote(outFile)}`); } finally { d.close(); }
 }
 
+/* A 404 means "this object does not exist" ONLY for these codes. A 404 NoSuchBucket (a mistyped bucket) is a CONFIGURATION error and must
+ * never be read as "empty bucket, start fresh". */
+const missingKey = e => e instanceof S3Error && e.status === 404 && (e.code === 'NoSuchKey' || e.code === 'NotFound');
+
 /* ---- lease (best effort single writer) ---- */
 async function readLease(s3, cfg) {
   try { return JSON.parse((await s3.get(cfg.prefix + 'lease.json')).body.toString('utf8')); }
-  catch (e) { if (e instanceof S3Error && e.status === 404) return null; if (e instanceof SyntaxError) return null; throw e; }
+  catch (e) { if (missingKey(e)) return null; if (e instanceof SyntaxError) return null; throw e; }
 }
 async function claimLease(s3, cfg, now = () => new Date()) {
   const prev = await readLease(s3, cfg), epoch = (prev && Number.isInteger(prev.epoch) ? prev.epoch : 0) + 1, writerId = crypto.randomBytes(8).toString('hex');
@@ -110,7 +117,7 @@ async function restoreIfNeeded({ s3, cfg, dbPath, maxSchema }) {
   let manifest;
   try { manifest = JSON.parse((await s3.get(cfg.prefix + 'latest.json')).body.toString('utf8')); }
   catch (e) {
-    if (e instanceof S3Error && e.status === 404) return { performed: false, reason: 'no_snapshot_in_bucket' };
+    if (missingKey(e)) return { performed: false, reason: 'no_snapshot_in_bucket' };
     throw new RestoreError(e instanceof SyntaxError ? 'latest.json is not valid JSON; refusing to start empty' : `cannot read the snapshot manifest (${e.message}); refusing to start empty`);
   }
   if (!manifest || manifest.format !== MANIFEST_FORMAT || typeof manifest.key !== 'string' || !manifest.key.startsWith(cfg.prefix + 'snapshots/') || !/^[0-9a-f]{64}$/.test(manifest.sha256 || '') || !Number.isInteger(manifest.bytes))
@@ -131,7 +138,7 @@ async function restoreIfNeeded({ s3, cfg, dbPath, maxSchema }) {
       return { performed: true, key: c.key, sha256: sha, bytes: body.length, created_at: c.created_at || null, user_version: v.userVersion, counts: v.counts, fallback: skipped.length > 0, skipped };
     } catch (e) {
       fs.rmSync(tmp, { force: true });
-      if (e instanceof S3Error && e.status !== 404) throw new RestoreError(`cannot download ${c.key} (${e.message}); refusing to start empty`);   // never fall back to OLDER data because of a transient failure
+      if (e instanceof S3Error && !missingKey(e)) throw new RestoreError(`cannot download ${c.key} (${e.message}); refusing to start empty`);   // never fall back to OLDER data because of a transient failure
       skipped.push({ key: c.key, reason: String(e.message).slice(0, 160) });
     }
   }
