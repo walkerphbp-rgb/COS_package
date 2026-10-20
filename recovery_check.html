@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CoS Recovery Check</title>
+<style>
+  :root { color-scheme: dark; --bg:#0e1116; --card:#171c24; --line:#2a3340; --fg:#e6edf3; --mut:#8b97a7; --ok:#3fb950; --bad:#f85149; --warn:#d29922; }
+  * { box-sizing: border-box; } body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
+  h1 { font-size:19px; margin:0 0 4px; } p.sub { color:var(--mut); margin:0 0 12px; } .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:12px; }
+  label { display:block; font-size:13px; color:var(--mut); margin:8px 0 4px; } input, textarea { width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:#0b0e13; color:var(--fg); font-size:16px; }
+  textarea { height:90px; font:12px monospace; } button { padding:12px 16px; border-radius:8px; border:0; background:#2f81f7; color:#fff; font-size:16px; font-weight:600; margin-top:10px; width:100%; } button.sec { background:#30363d; } button:disabled { opacity:.5; }
+  .row { display:flex; gap:8px; padding:6px 0; border-top:1px solid var(--line); } .row:first-child { border-top:0; } .ic { width:22px; flex:none; text-align:center; } .t { flex:1; } .d { color:var(--mut); font-size:13px; word-break:break-word; }
+  #verdict { font-weight:700; font-size:17px; } pre { white-space:pre-wrap; word-break:break-word; font-size:12px; background:#0b0e13; padding:10px; border-radius:8px; max-height:320px; overflow:auto; } .small { font-size:12px; color:var(--mut); }
+</style>
+</head>
+<body>
+<h1>Chief of Staff — Recovery Check</h1>
+<p class="sub">Proves a redeploy restored the same data. Step 1 before the redeploy, step 2 after it. Read-only: it creates nothing.</p>
+<div class="card">
+  <label for="base">Backend URL</label><input id="base" value="https://cos-package.onrender.com" autocapitalize="off" autocorrect="off" spellcheck="false">
+  <label for="tok">Operator token (kept only in this page)</label><input id="tok" type="password" autocomplete="off">
+  <button id="b1">1. Save baseline (before the redeploy)</button>
+  <button id="b2" class="sec">2. Compare (after the redeploy)</button>
+  <p class="small"><b>Keep this page open and the screen on.</b> Wait until the baseline says the backup is up to date. If your browser forgets the baseline, paste it into the box below before comparing.</p>
+  <label for="paste">Baseline JSON (filled in automatically; paste here if needed)</label><textarea id="paste" spellcheck="false"></textarea>
+</div>
+<div class="card"><div id="verdict">Not run yet.</div><div id="checks"></div></div>
+<div class="card"><button class="sec" id="copy" disabled>Copy result JSON</button><pre id="out"></pre></div>
+
+<script id="recovery">
+'use strict';
+/* All logic is in runRecovery so it can be tested outside a browser (test30_recovery_check.js). The page writes results with textContent only. */
+async function sha256Hex(text) {
+  try { const b = new TextEncoder().encode(text), h = await crypto.subtle.digest('SHA-256', b); return [...new Uint8Array(h)].map(x => x.toString(16).padStart(2, '0')).join(''); }
+  catch { let h = 5381; for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0; return 'weak-' + (h >>> 0).toString(16); }
+}
+const canon = v => Array.isArray(v) ? '[' + v.map(canon).join(',') + ']' : v && typeof v === 'object' ? '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + canon(v[k])).join(',') + '}' : JSON.stringify(v === undefined ? null : v);
+
+/* The stable, restore-relevant facts about one mission (nothing time-varying that a redeploy could legitimately change). */
+function fingerprintOf(x) {
+  const g = (o, k) => (o && o[k] !== undefined ? o[k] : null);
+  return {
+    status: g(x, 'status'), tier: g(x.risk, 'tier'), approval: g(x.approval, 'status'), decided_by: x.approval && x.approval.decided_by ? [g(x.approval.decided_by, 'type'), g(x.approval.decided_by, 'name')] : null,
+    executed: g(x.execution, 'executed'), executions: g(x.execution, 'count'),
+    format: x.format ? [g(x.format, 'status'), g(x.format, 'format_id'), g(x.format, 'format_version'), g(x.format, 'manifest_hash')] : null,
+    router: x.router ? [g(x.router, 'status'), g(x.router, 'mode'), g(x.router, 'plan_id'), g(x.router, 'plan_version')] : null,
+    effects: (x.format_effects || []).map(f => f.effect_code), gaps: (x.gaps || []).map(f => f.code), timeline: (x.timeline || []).map(t => t.status),
+    claims: x.evidence ? [g(x.evidence, 'claims_total'), g(x.evidence, 'evidence_verified'), g(x.evidence, 'unverified'), g(x.evidence, 'flagged_instruction_like')] : null,
+  };
+}
+
+async function runRecovery(cfg, deps) {
+  const fetchFn = (deps && deps.fetch) || fetch, mode = cfg.mode, base = String(cfg.base || '').replace(/\/+$/, ''), token = String(cfg.token || '');
+  const checks = [], add = (id, status, title, detail) => { const c = { id, status, title, detail: detail === undefined ? '' : String(detail).slice(0, 400) }; checks.push(c); if (deps && deps.onCheck) deps.onCheck(c); return c; };
+  const finish = extra => {
+    const f = checks.filter(c => c.status === 'FAIL'), i = checks.filter(c => c.status === 'INCONCLUSIVE');
+    return { mode, verdict: f.length ? 'FAIL' : i.length ? 'INCONCLUSIVE' : (mode === 'baseline' ? 'BASELINE SAVED' : 'PASS'), counts: { pass: checks.filter(c => c.status === 'PASS').length, fail: f.length, inconclusive: i.length }, checks, ...extra };
+  };
+  async function api(path) {
+    const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 90000);
+    try { const r = await fetchFn(base + path, { signal: ctl.signal, headers: token ? { Authorization: 'Bearer ' + token } : {} }); let j = null; try { j = await r.json(); } catch {} return { status: r.status, json: j }; }
+    catch (e) { return { status: 0, json: null, error: String(e && e.message || e) }; } finally { clearTimeout(t); }
+  }
+  const h = await api('/health');
+  if (h.status !== 200 || !h.json) { add('R1', 'INCONCLUSIVE', 'Backend reachable', h.error || `HTTP ${h.status}`); return finish({}); }
+  const H = h.json, B = H.backup || { enabled: false };
+  add('R1', 'PASS', 'Backend reachable', `version ${H.version}`);
+  add('R2', H.db && H.db.guards && H.db.guards.ok && H.db.schema && H.db.schema.ok ? 'PASS' : 'FAIL', 'Database guards and schema OK', H.db && JSON.stringify({ guards: H.db.guards && H.db.guards.ok, schema: H.db.schema && H.db.schema.ok }));
+  add('R3', B.enabled ? 'PASS' : 'FAIL', 'B2 backup is enabled on this deployment', B.enabled ? `${B.bucket} / ${B.prefix}` : 'backup.enabled is false: nothing to recover from');
+  if (!B.enabled) return finish({});
+
+  // current mission fingerprints (read-only Decision Memory endpoints)
+  const items = []; let cursor = null;
+  for (let page = 0; page < 5; page++) {
+    const r = await api('/api/memory/missions?limit=100' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
+    if (r.status !== 200 || !r.json) { add('R4', 'INCONCLUSIVE', 'Read the mission list', `HTTP ${r.status} ${r.error || (r.json && r.json.error) || ''}`); return finish({}); }
+    items.push(...r.json.items.map(m => m.id)); cursor = r.json.next_cursor; if (!cursor) break;
+  }
+  const fps = {};
+  for (const id of items.slice(0, 200)) {
+    const e = await api(`/api/memory/missions/${id}/explain`);
+    if (e.status !== 200 || !e.json) { add('R4', 'INCONCLUSIVE', 'Read a mission explanation', `${id.slice(0, 8)} HTTP ${e.status} ${e.error || ''}`); return finish({}); }
+    fps[id] = fingerprintOf(e.json);
+  }
+  const overall = await sha256Hex(canon(fps));
+  add('R4', 'PASS', `Read ${items.length} mission(s) with their full explanation`, `fingerprint ${overall.slice(0, 16)}`);
+
+  if (mode === 'baseline') {
+    add('R5', B.pending_changes === false && B.last_verified_at ? 'PASS' : 'INCONCLUSIVE', 'The backup is up to date (no pending changes, newest snapshot verified)', `pending_changes=${B.pending_changes}, last_verified_at=${B.last_verified_at}`);
+    add('R6', items.length > 0 ? 'PASS' : 'INCONCLUSIVE', 'There is data to protect (at least one mission)', `${items.length} mission(s)`);
+    return finish({ baseline: { taken_at: new Date().toISOString(), base, missions: fps, overall, backup: { last_key: B.last_key, last_verified_at: B.last_verified_at, writer_id: B.writer_id, epoch: B.epoch, restore: B.restore }, count: items.length } });
+  }
+
+  // compare mode
+  const bl = cfg.baseline;
+  if (!bl || !bl.missions || !bl.backup) { add('R5', 'INCONCLUSIVE', 'A saved baseline is available', 'no baseline found: run step 1 before the redeploy, or paste it'); return finish({}); }
+  const rs = B.restore || {};
+  add('R5', rs.performed === true ? 'PASS' : 'INCONCLUSIVE', 'This instance STARTED BY RESTORING from B2 (so the data really came back from the backup)', rs.performed ? `restored ${rs.key}` : 'restore.performed is false: the instance was not rebuilt (no redeploy happened, or its local database survived), so a match proves nothing');
+  const blFile = String(bl.backup.last_key || '').split('/').pop(), rsFile = String(rs.key || '');
+  add('R6', rs.performed && blFile && rsFile >= blFile ? 'PASS' : (rs.performed ? 'FAIL' : 'INCONCLUSIVE'), 'The snapshot restored is at least as new as the one the baseline relied on (not an older one)', `baseline snapshot ${blFile || '?'}; restored ${rsFile || '?'}; fallback=${!!rs.fallback}`);
+  add('R7', rs.fallback ? 'FAIL' : 'PASS', 'No fallback to an older snapshot was needed', `fallback=${!!rs.fallback}`);
+  const missing = [], changed = [];
+  for (const [id, fp] of Object.entries(bl.missions)) { if (!fps[id]) missing.push(id.slice(0, 8)); else if (canon(fps[id]) !== canon(fp)) changed.push(id.slice(0, 8)); }
+  add('R8', missing.length === 0 ? 'PASS' : 'FAIL', `All ${Object.keys(bl.missions).length} baseline mission(s) are present after the restore`, missing.length ? 'MISSING: ' + missing.join(', ') : '');
+  add('R9', changed.length === 0 ? 'PASS' : 'FAIL', 'Each restored mission is IDENTICAL to its baseline: status, risk tier, approval and who approved, execution count, format + manifest hash, routing, policy effects, gaps, audit timeline, evidence counts', changed.length ? 'DIFFERENT: ' + changed.join(', ') : '');
+  const extra = items.filter(id => !bl.missions[id]).length;
+  add('R10', 'PASS', 'Missions created after the baseline (informational)', `${extra} new mission(s)`);
+  return finish({ compared: { baseline_taken_at: bl.taken_at, baseline_count: bl.count, current_count: items.length, restore: rs, backup_now: { last_verified_at: B.last_verified_at, epoch: B.epoch, writer_id: B.writer_id } } });
+}
+if (typeof globalThis !== 'undefined') { globalThis.__runRecovery = runRecovery; globalThis.__fingerprintOf = fingerprintOf; }
+
+if (typeof document !== 'undefined') {
+  const $ = id => document.getElementById(id), icon = { PASS: '✅', FAIL: '❌', INCONCLUSIVE: '⚠️' }; let last = null;
+  const KEY = 'cos_recovery_baseline';
+  try { const s = localStorage.getItem(KEY); if (s) $('paste').value = s; } catch {}
+  function row(c) {
+    const r = document.createElement('div'); r.className = 'row'; const ic = document.createElement('div'); ic.className = 'ic'; ic.textContent = icon[c.status] || '•';
+    const t = document.createElement('div'); t.className = 't'; const a = document.createElement('div'); a.textContent = `${c.id} ${c.title}`; const d = document.createElement('div'); d.className = 'd'; d.textContent = c.detail; t.append(a, d); r.append(ic, t); $('checks').append(r);
+  }
+  async function go(mode) {
+    let wl = null; try { if (navigator.wakeLock) wl = await navigator.wakeLock.request('screen'); } catch {}
+    $('b1').disabled = $('b2').disabled = true; $('copy').disabled = true; $('checks').textContent = ''; $('out').textContent = ''; $('verdict').textContent = 'Running… (a sleeping instance can take a minute)';
+    let baseline = null; if (mode === 'compare') { try { baseline = JSON.parse($('paste').value); } catch {} }
+    try {
+      last = await runRecovery({ mode, base: $('base').value.trim(), token: $('tok').value.trim(), baseline }, { onCheck: row });
+      $('verdict').textContent = 'Verdict: ' + last.verdict;
+      if (mode === 'baseline' && last.baseline) { const s = JSON.stringify(last.baseline); $('paste').value = s; try { localStorage.setItem(KEY, s); } catch {} }
+      $('out').textContent = JSON.stringify(last, null, 2); $('copy').disabled = false;
+    } catch (e) { $('verdict').textContent = 'Error: ' + (e && e.message || e); }
+    try { wl && wl.release(); } catch {} $('b1').disabled = $('b2').disabled = false;
+  }
+  $('b1').onclick = () => go('baseline'); $('b2').onclick = () => go('compare');
+  $('copy').onclick = async () => { try { await navigator.clipboard.writeText($('out').textContent); $('copy').textContent = 'Copied'; } catch { $('copy').textContent = 'Select the text below and copy it'; } setTimeout(() => $('copy').textContent = 'Copy result JSON', 2500); };
+}
+</script>
+</body>
+</html>

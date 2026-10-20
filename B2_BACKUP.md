@@ -60,16 +60,18 @@ Any missing or invalid value, with the feature on, stops the server at boot (exi
 
 ## 6. The live test (required before claiming persistence)
 
-A successful upload is not proof of recoverability. On Render, with the variables set:
+A successful upload is not proof of recoverability. The page `recovery_check.html` (tested by Test 30) does the comparison for you. On Render, with the variables set:
 
-1. Run `format_live_runner.html` (or any missions), note the mission ids and, in the dashboard, one approved and executed mission.
-2. Wait until `/health` shows `backup.pending_changes: false` and a recent `last_verified_at`. Save that `/health` JSON.
+1. Create real data: run `format_live_runner.html`, then in the dashboard approve one `smme_finance` mission so there is an approval and an execution to protect.
+2. Open `recovery_check.html` (download it to the phone and open it in the browser), enter the operator token, and tap **1. Save baseline**. It must say **BASELINE SAVED** with the backup up to date. It fingerprints every mission (status, risk tier, approver, executions, format hash, routing, policy effects, audit timeline, evidence counts). Keep the baseline text it shows.
 3. **Redeploy** (Manual Deploy). On a free instance this erases the local database.
 4. Open `/health`: expect `backup.restore.performed: true`, `init.result: "not_needed"`, `db.guards.ok: true`.
-5. Open the dashboard: the same missions, the approval and the execution must still be there, and Decision Memory `explain` must return the same result.
-6. Repeat once more (a second redeploy) to prove it is repeatable.
+5. In `recovery_check.html` tap **2. Compare**. It must say **PASS**: the instance started by restoring (R5), the restored snapshot is not older than the baseline's (R6), no fallback (R7), every baseline mission is present (R8) and identical (R9).
+6. Repeat steps 1 to 5 once more (a second redeploy).
 
-Only then may this be called PROVEN on Render. Until then it is IMPLEMENTED / LIVE-VALIDATION PENDING.
+An INCONCLUSIVE at R5 means no restore happened (no redeploy, or a local database survived), so a match proves nothing. FAIL names the mission that is missing or different.
+
+Only a PASS twice may be called PROVEN on Render. Until then it is IMPLEMENTED / LIVE-VALIDATION PENDING.
 
 ## 7. Manual recovery (if ever needed)
 

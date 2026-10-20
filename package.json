@@ -6,7 +6,7 @@
   "main": "cos_backend.js",
   "scripts": {
     "start": "node cos_backend.js",
-    "test": "node test19b_tier_rules.js && node test19c_runanalyst_regression.js && node test19d_mission_failure.js && node test20_gate.js fixed && node test21_integration.js && node test22_grounding.js fixed && node test23_persistence.js && node test24_entrypoint.js && node test25_decision_memory.js && node test26_formats.js && node test27_format_runner.js && node test28_router.js && node test29_b2_backup.js"
+    "test": "node test19b_tier_rules.js && node test19c_runanalyst_regression.js && node test19d_mission_failure.js && node test20_gate.js fixed && node test21_integration.js && node test22_grounding.js fixed && node test23_persistence.js && node test24_entrypoint.js && node test25_decision_memory.js && node test26_formats.js && node test27_format_runner.js && node test28_router.js && node test29_b2_backup.js && node test30_recovery_check.js"
   },
   "engines": {
     "node": ">=22.5.0"
