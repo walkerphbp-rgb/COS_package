@@ -46,3 +46,5 @@ jobs:
         run: node test28_router.js
       - name: Run 29 (B2 backup and recovery)
         run: node test29_b2_backup.js
+      - name: Run 30 (recovery check page logic)
+        run: node test30_recovery_check.js
