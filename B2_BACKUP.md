@@ -1,6 +1,6 @@
 # Backblaze B2 backup and recovery (opt-in)
 
-**Status: IMPLEMENTED LOCALLY (Test 29). NOT validated against the real Backblaze service. NOT deployed. Persistence is NOT proven until the live test in §6 passes.**
+**Status: LIVE-VALIDATED for planned redeploys. Test 29 and Test 30 pass locally, and `recovery_check.html` returned PASS twice against the real Backblaze service on a Render free instance with no disk (2026-10-21: 5 missions, then 7 missions, restored identical). NOT validated live for hard crashes (SIGKILL, out-of-memory, host failure) or for overlapping instances during a deploy; see §1.**
 
 ## 1. What this is, and what it is not
 
@@ -71,7 +71,9 @@ A successful upload is not proof of recoverability. The page `recovery_check.htm
 
 An INCONCLUSIVE at R5 means no restore happened (no redeploy, or a local database survived), so a match proves nothing. FAIL names the mission that is missing or different.
 
-Only a PASS twice may be called PROVEN on Render. Until then it is IMPLEMENTED / LIVE-VALIDATION PENDING.
+Only a PASS twice may be called PROVEN on Render.
+
+**Result (2026-10-21, free Render instance, no disk, bucket `cos-memory-disk`):** two formal compare runs returned PASS 10/10. The first restored 5 missions identical to the baseline. The second used a baseline that included 2 missions created after the first restore, and restored all 7 identical, with no fallback. So persistence is PROVEN for planned redeploys on this setup. It is NOT proven for a hard crash between snapshots or for writes made during a deploy overlap (§1 and §8).
 
 ## 7. Manual recovery (if ever needed)
 
@@ -80,6 +82,6 @@ Snapshots are ordinary SQLite files at `<prefix>snapshots/<timestamp>-e<epoch>-<
 ## 8. Known limits
 
 - Not continuous: see §1. Lower `COS_B2_MIN_INTERVAL_SEC` (minimum 1) to shrink the window; each snapshot is a full copy.
-- Not verified against the real Backblaze service yet (the tests use a fake S3 server that verifies AWS Signature V4, and the signer matches AWS's published example).
+- Verified against the real Backblaze service for planned redeploys only (2 formal PASSes, §6). The automated tests still use a fake S3 server that verifies AWS Signature V4. A hard crash and a deploy overlap have not been exercised live.
 - No client-side encryption (rely on a private bucket plus SSE-B2).
 - Overlapping instances during a deploy can lose the older instance's last writes (§1).
