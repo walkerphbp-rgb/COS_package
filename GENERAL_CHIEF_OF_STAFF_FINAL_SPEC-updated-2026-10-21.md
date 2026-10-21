@@ -97,12 +97,13 @@ Two roles from the earlier six-specialist Brand-Manager framing (Business Operat
 
 SQLite remains the live transactional database. Backblaze B2 is an opt-in snapshot-backup and restore layer over SQLite (`COS_B2_BACKUP=1`); B2 is **not** a filesystem and is **not** used as a live transactional SQLite store. The existing SQLite transaction, migration, Router, canonical execution-gate, database-guard, Decision Memory and audit-integrity behavior must remain authoritative.
 
-Operator-reported live evidence dated **2026-10-21** records two formal `recovery_check` COMPARE passes against Render and B2:
+Operator-reported live evidence dated **2026-10-21** records three formal `recovery_check` COMPARE passes against Render and B2:
 
 - **Run 1:** 10/10 checks passed; 5 missions compared; restored snapshot matched baseline **e10**; no fallback used.
 - **Run 2:** 10/10 checks passed; 7 missions compared; restored snapshot matched baseline **e11**; no fallback used.
+- **Run 3:** 10/10 checks passed; 12 missions compared; restored from the exact snapshot key `20261021T170454369Z-e21-bd741c8d.db`; writer instance changed to `c2680e76`, epoch **21 → 22**, confirming a new instance after restart. All 12 missions matched across status, tier, approval, format hashes, routing, effects, gaps, timelines and evidence counts; identifier `030c0764` matched as well. Baseline was taken at rest (`pending_changes=false`) and no missions were created after it; no fallback was used.
 
-These are operator-run live checks; the operator reports that the run output is retained by the operator. This specification records the reported results and does not claim independent inspection of that output.
+These are operator-run live checks; the operator reports that the run output is retained by the operator. This specification records the reported results and does not claim independent inspection of that output. Two earlier attempts were invalid procedure runs—not recovery failures: one used a mid-flight baseline, and one compared without a redeploy. They are excluded from the three passing runs.
 
 **Not yet live-validated:** (1) a hard crash between snapshots can lose writes made after the last verified snapshot; backup is not continuous; (2) deploy overlap / in-flight writes. Lease fencing is intended to prevent split-brain, but loss of in-flight writes has not been excluded by the stated checks.
 
@@ -248,6 +249,6 @@ All 🔴 from `SECURITY_BOUNDARIES.md`, consolidated:
 
 ## Completion statement — current, accurate wording
 
-> The architecture has evidence across Tests 1–30, including live Format and Router validation and operator-run Backblaze B2 planned-redeploy recovery comparisons (2026-10-21). The reported B2 checks each passed 10/10, comparing 5 missions against baseline e10 and 7 missions against baseline e11, with no fallback used. The operator retains the run output; these results are recorded as operator-reported live evidence, not independently inspected evidence. This does not establish hard-crash recovery or exclude loss of in-flight writes during deploy overlap. See the status labels and open requirements above and in `SECURITY_BOUNDARIES.md`.
+> The architecture has evidence across Tests 1–30, including live Format and Router validation and three operator-run Backblaze B2 planned-redeploy recovery comparisons (2026-10-21). All three reported B2 checks passed 10/10: Run 1 compared 5 missions against baseline e10; Run 2 compared 7 missions against baseline e11; Run 3 compared 12 missions using snapshot `20261021T170454369Z-e21-bd741c8d.db`, with writer instance `c2680e76` and epoch 21 → 22. No fallback was used. The operator retains the run output; these results are recorded as operator-reported live evidence, not independently inspected evidence. This does not establish hard-crash recovery or exclude loss of in-flight writes during deploy overlap. See the status labels and open requirements above and in `SECURITY_BOUNDARIES.md`.
 
 Do not interpret the live validation of these named paths as proof that every production requirement or failure mode is closed.
