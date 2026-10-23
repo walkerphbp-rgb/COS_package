@@ -89,7 +89,10 @@ async function liveFetch(label, url, opts) {
 }
 async function readBodyJson(label, res, signal) {
   let text;
-  try { text = await res.text(); }
+  try {
+    // Real fetch responses always have text(); tolerate json()-only test mocks.
+    text = typeof res.text === 'function' ? await res.text() : JSON.stringify(await res.json());
+  }
   catch (e) {
     if (signal && signal.aborted) throw e;
     throw providerError('provider_network_error', label, `response body read failed: ${(e && e.message) || e}`, e);
