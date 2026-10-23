@@ -1,0 +1,65 @@
+--- provider_fallback.orig.js	2026-10-23 06:53:12.535614046 +0000
++++ provider_fallback.js	2026-10-23 06:53:26.890202748 +0000
+@@ -43,15 +43,46 @@
+  * falling back would hide it). Override per call with policy.fallbackOnStatus. */
+ const DEFAULT_FALLBACK_STATUS = Object.freeze([429, 500, 503, 504]);
+ 
++/* A per-provider timeout (provider.timeoutMs) is reported as status 598 with code 'provider_timeout'.
++ * 598 is a synthetic, non-HTTP marker so provider_calls.attempted_status_code tells a timeout apart
++ * from a real 504 without a schema change. It is deliberately NOT in DEFAULT_FALLBACK_STATUS:
++ * timeouts are matched by err.code below, so the status list (and its tests) stay as they were. */
++const TIMEOUT_STATUS = 598;
++
+ function defaultShouldFallback(err, policy) {
++  if (err && err.code === 'provider_timeout') return !(policy && policy.fallbackOnTimeout === false);
+   const codes = (policy && policy.fallbackOnStatus) || DEFAULT_FALLBACK_STATUS;
+   return codes.includes(err && err.status);
+ }
+ 
+ /**
++ * Calls provider.call(prompt, { signal }). If provider.timeoutMs > 0, the attempt is abandoned after
++ * that long: the signal is aborted (so a real fetch is cancelled) AND the call is raced, so a stub or
++ * provider that ignores the signal still cannot hang the chain. No timeoutMs = old behaviour.
++ */
++function callWithTimeout(provider, prompt) {
++  const ms = Number(provider.timeoutMs);
++  if (!(ms > 0)) return provider.call(prompt, {});
++  const ac = new AbortController();
++  let timer;
++  const timeout = new Promise((_, reject) => {
++    timer = setTimeout(() => {
++      const err = new Error(`provider "${provider.name}" timed out after ${ms}ms`);
++      err.status = TIMEOUT_STATUS;
++      err.code = 'provider_timeout';
++      reject(err);   // reject first so the race settles with the timeout, not the abort error
++      ac.abort();
++    }, ms);
++  });
++  const call = Promise.resolve().then(() => provider.call(prompt, { signal: ac.signal }));
++  call.catch(() => {});   // a late rejection from the abandoned call must not become an unhandledRejection
++  return Promise.race([call, timeout]).finally(() => clearTimeout(timer));
++}
++
++/**
+  * @param {{prompt: any, validate?: (resp:any)=>boolean, meta?: object}} task
+  * @param {{name:string, model?:string, call:(prompt:any)=>Promise<any>}[]} providers
+- * @param {{fallbackOnStatus?: number[], injectFailureFor?: (provider, meta)=>boolean, injectStatus?: number}} [policy]
++ * @param {{fallbackOnStatus?: number[], fallbackOnTimeout?: boolean, injectFailureFor?: (provider, meta)=>boolean, injectStatus?: number}} [policy]
+  */
+ async function callWithFallback(task, providers, policy) {
+   const { prompt, validate, meta } = task || {};
+@@ -82,7 +113,7 @@
+         throw err;
+       }
+ 
+-      const response = await provider.call(prompt);
++      const response = await callWithTimeout(provider, prompt);
+       const valid = typeof validate === 'function' ? !!validate(response) : true;
+ 
+       if (!valid) {
+@@ -158,4 +189,4 @@
+   try { return JSON.stringify(value); } catch (e) { return String(value); }
+ }
+ 
+-module.exports = { callWithFallback, toProviderCallRow, DEFAULT_FALLBACK_STATUS };
++module.exports = { callWithFallback, toProviderCallRow, DEFAULT_FALLBACK_STATUS, TIMEOUT_STATUS };

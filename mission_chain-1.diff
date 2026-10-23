@@ -1,0 +1,53 @@
+--- mission_chain.orig.js	2026-10-23 06:53:12.537185074 +0000
++++ mission_chain.js	2026-10-23 06:53:12.680477460 +0000
+@@ -72,13 +72,13 @@
+ // validate() functions below only inspect known fields, so this extra key is
+ // inert everywhere else it flows (recommendations/artifacts inserts, etc).
+ 
+-async function callGeminiLive({ apiKey, model }, prompt, schemaHint) {
++async function callGeminiLive({ apiKey, model }, prompt, schemaHint, signal) {
+   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+   const body = {
+     contents: [{ parts: [{ text: `${prompt}\n\nRespond ONLY with JSON matching: ${schemaHint}` }] }],
+     generationConfig: { responseMimeType: 'application/json' },
+   };
+-  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
++  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal });
+   if (res.status === 429) { const err = new Error('rate limited (live)'); err.status = 429; throw err; }
+   if (!res.ok) { const err = new Error(`gemini http ${res.status}`); err.status = res.status; throw err; }
+   const data = await res.json();
+@@ -90,14 +90,14 @@
+   return parsed;
+ }
+ 
+-async function callGroqLive({ apiKey, model }, prompt, schemaHint) {
++async function callGroqLive({ apiKey, model }, prompt, schemaHint, signal) {
+   const url = 'https://api.groq.com/openai/v1/chat/completions';
+   const body = {
+     model,
+     messages: [{ role: 'user', content: `${prompt}\n\nRespond ONLY with JSON matching: ${schemaHint}` }],
+     response_format: { type: 'json_object' },
+   };
+-  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, body: JSON.stringify(body) });
++  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, body: JSON.stringify(body), signal });
+   if (!res.ok) { const err = new Error(`groq http ${res.status}`); err.status = res.status; throw err; }
+   const data = await res.json();
+   const text = data.choices?.[0]?.message?.content || '{}';
+@@ -108,10 +108,15 @@
+   return parsed;
+ }
+ 
++// Per-attempt timeouts (the abort also covers reading the response body). Worst case for one call
++// is GEMINI + GROQ. Gemini is the primary and slower; Groq is shorter. Override with env vars.
++const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS) || 45000;
++const GROQ_TIMEOUT_MS = Number(process.env.GROQ_TIMEOUT_MS) || 30000;
++
+ function buildProviders(keys, models, schemaHint) {
+   const list = [];
+-  if (keys.gemini) list.push({ name: 'gemini', model: models.gemini, call: (p) => callGeminiLive({ apiKey: keys.gemini, model: models.gemini }, p, schemaHint) });
+-  if (keys.groq) list.push({ name: 'groq', model: models.groq, call: (p) => callGroqLive({ apiKey: keys.groq, model: models.groq }, p, schemaHint) });
++  if (keys.gemini) list.push({ name: 'gemini', model: models.gemini, timeoutMs: GEMINI_TIMEOUT_MS, call: (p, ctx) => callGeminiLive({ apiKey: keys.gemini, model: models.gemini }, p, schemaHint, ctx && ctx.signal) });
++  if (keys.groq) list.push({ name: 'groq', model: models.groq, timeoutMs: GROQ_TIMEOUT_MS, call: (p, ctx) => callGroqLive({ apiKey: keys.groq, model: models.groq }, p, schemaHint, ctx && ctx.signal) });
+   if (!list.length) throw new Error('No provider API keys configured (need at least GEMINI_API_KEY)');
+   return list;
+ }
