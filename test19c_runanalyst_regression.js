@@ -56,7 +56,14 @@ global.fetch = async (url) => {
     candidates: [{ content: { parts: [{ text: JSON.stringify(nextAnalyst) }] } }],
     usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
   };
-  return { ok: true, status: 200, json: async () => body };
+  // Real fetch responses expose both json() and text(); the hardened transport reads text().
+  return {
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    json: async () => body,
+    text: async () => JSON.stringify(body),
+  };
 };
 
 const nowISO = () => new Date().toISOString();
