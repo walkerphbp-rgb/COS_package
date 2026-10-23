@@ -31,7 +31,7 @@
 
 'use strict';
 const crypto = require('crypto');
-const { callWithFallback, toProviderCallRow } = require('./provider_fallback');
+const { callWithFallback, toProviderCallRow, NETWORK_ERROR_STATUS, BAD_JSON_STATUS } = require('./provider_fallback');
 const { gateExecuteInTx, SYSTEM_APPROVAL_TEXT } = require('./gate');
 
 function nowISO() { return new Date().toISOString(); }
@@ -72,18 +72,48 @@ function computeRiskTierFromClaims(claims) {
 // validate() functions below only inspect known fields, so this extra key is
 // inert everywhere else it flows (recommendations/artifacts inserts, etc).
 
+/* Transport failures are tagged here, at the source, so callWithFallback can tell them from programmer bugs.
+ * The original error is kept as err.cause and its message is in err.message. */
+function providerError(code, label, detail, cause) {
+  const err = new Error(`${label} ${code === 'provider_bad_json' ? 'bad json' : 'network error'}: ${detail}`, { cause });
+  err.code = code;
+  err.status = code === 'provider_bad_json' ? BAD_JSON_STATUS : NETWORK_ERROR_STATUS;
+  return err;
+}
+async function liveFetch(label, url, opts) {
+  try { return await fetch(url, opts); }
+  catch (e) {
+    if (opts && opts.signal && opts.signal.aborted) throw e;   // our own timeout abort: callWithFallback already reported it
+    throw providerError('provider_network_error', label, (e && e.message) || String(e), e);
+  }
+}
+async function readBodyJson(label, res, signal) {
+  let text;
+  try { text = await res.text(); }
+  catch (e) {
+    if (signal && signal.aborted) throw e;
+    throw providerError('provider_network_error', label, `response body read failed: ${(e && e.message) || e}`, e);
+  }
+  try { return JSON.parse(text); }
+  catch (e) { throw providerError('provider_bad_json', label, `response body is not JSON (${e.message})`, e); }
+}
+function parseModelJson(label, text) {
+  try { return JSON.parse(text); }
+  catch (e) { throw providerError('provider_bad_json', label, `model output is not valid JSON (${e.message})`, e); }
+}
+
 async function callGeminiLive({ apiKey, model }, prompt, schemaHint, signal) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   const body = {
     contents: [{ parts: [{ text: `${prompt}\n\nRespond ONLY with JSON matching: ${schemaHint}` }] }],
     generationConfig: { responseMimeType: 'application/json' },
   };
-  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal });
+  const res = await liveFetch('gemini', url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal });
   if (res.status === 429) { const err = new Error('rate limited (live)'); err.status = 429; throw err; }
   if (!res.ok) { const err = new Error(`gemini http ${res.status}`); err.status = res.status; throw err; }
-  const data = await res.json();
+  const data = await readBodyJson('gemini', res, signal);
   const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-  const parsed = JSON.parse(text);
+  const parsed = parseModelJson('gemini', text);
   parsed.__usage = data.usageMetadata
     ? { provider: 'gemini', prompt_tokens: data.usageMetadata.promptTokenCount, completion_tokens: data.usageMetadata.candidatesTokenCount, total_tokens: data.usageMetadata.totalTokenCount }
     : null;
@@ -97,11 +127,11 @@ async function callGroqLive({ apiKey, model }, prompt, schemaHint, signal) {
     messages: [{ role: 'user', content: `${prompt}\n\nRespond ONLY with JSON matching: ${schemaHint}` }],
     response_format: { type: 'json_object' },
   };
-  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, body: JSON.stringify(body), signal });
+  const res = await liveFetch('groq', url, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, body: JSON.stringify(body), signal });
   if (!res.ok) { const err = new Error(`groq http ${res.status}`); err.status = res.status; throw err; }
-  const data = await res.json();
+  const data = await readBodyJson('groq', res, signal);
   const text = data.choices?.[0]?.message?.content || '{}';
-  const parsed = JSON.parse(text);
+  const parsed = parseModelJson('groq', text);
   parsed.__usage = data.usage
     ? { provider: 'groq', prompt_tokens: data.usage.prompt_tokens, completion_tokens: data.usage.completion_tokens, total_tokens: data.usage.total_tokens }
     : null;
@@ -173,13 +203,17 @@ function recordDecision(db, missionId, status, rationale) {
  * Researcher call in genuinely fetched content instead of trusting Gemini to
  * name a source_url after the fact.
  */
-async function fetchGrounding(seedUrl) {
+// Bounded: the abort also covers reading the body. Override with GROUNDING_TIMEOUT_MS.
+const GROUNDING_TIMEOUT_MS = Number(process.env.GROUNDING_TIMEOUT_MS) || 15000;
+async function fetchGrounding(seedUrl, timeoutMs = GROUNDING_TIMEOUT_MS) {
   try {
-    const res = await fetch(seedUrl);
+    const res = await fetch(seedUrl, { signal: AbortSignal.timeout(timeoutMs) });
     const content = await res.text();
     return { statusCode: res.status, bytes: content.length, error: res.ok ? null : `http ${res.status}`, content };
   } catch (e) {
-    return { statusCode: 0, bytes: 0, error: e.message, content: '' };
+    // fetchFailed = the fetch itself failed or timed out (no HTTP response). An HTTP error page is NOT this case.
+    const timedOut = !!e && (e.name === 'TimeoutError' || e.name === 'AbortError');
+    return { statusCode: 0, bytes: 0, error: timedOut ? `grounding fetch timed out after ${timeoutMs}ms` : (e && e.message) || String(e), content: '', fetchFailed: true, timedOut };
   }
 }
 
@@ -237,6 +271,14 @@ function hostAllowed(seedUrl, domains) { try { return domains.includes(new URL(s
 
 async function runResearcher(db, { missionId, callSeq, requestText, nonce, seedUrl, keys, models, persona, minSnippet, fx }) {
   const grounding = await fetchGrounding(seedUrl);
+  if (grounding.fetchFailed) {
+    // FAIL CLOSED: no fetched evidence means no model call and no claims. Record the failure, then stop the mission.
+    db.prepare(`INSERT INTO fetch_log (mission_id, url, status_code, bytes, error, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(missionId, seedUrl, 0, 0, grounding.error, nowISO());
+    const err = new Error(`grounding fetch failed (${grounding.error}); mission stopped before any model call: no verified evidence`);
+    err.code = grounding.timedOut ? 'grounding_timeout' : 'grounding_fetch_failed';
+    throw err;
+  }
   const prompt = `You are a research specialist. Task: ${requestText}\n\n` +
     `Reference material (already fetched server-side — treat as grounding evidence, do not invent a different source_url):\n---\n${grounding.content.slice(0, 4000)}\n---\n` +
     `Cite source_url exactly as: ${seedUrl}\n` +
@@ -478,4 +520,4 @@ try {
   } catch (e) { e.missionId = missionId; throw e; }
 }
 
-module.exports = { runLiveMission, runAnalyst, runResearcher, isGrounded, computeRiskTierFromClaims, containsInjectionPattern };
+module.exports = { runLiveMission, runAnalyst, runResearcher, isGrounded, computeRiskTierFromClaims, containsInjectionPattern, buildProviders, fetchGrounding };
