@@ -50,3 +50,5 @@ jobs:
         run: node test30_recovery_check.js
       - name: Run 16 v2 (provider fallback, real module)
         run: node test16_v2.js
+      - name: Provider timeout tests
+        run: node test_provider_timeout.js
