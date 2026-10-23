@@ -36,8 +36,15 @@
 
 'use strict';
 
+/* Statuses that mean "this provider is temporarily unable", so trying the next provider is safe
+ * (the calls are read-only generation, validated and Critic-checked downstream either way).
+ * 429 rate limited, 500 internal error, 503 overloaded/unavailable, 504 gateway/deadline timeout.
+ * Deliberately NOT included: 400/401/403/404 (our bug or bad key; Groq would not fix it and
+ * falling back would hide it). Override per call with policy.fallbackOnStatus. */
+const DEFAULT_FALLBACK_STATUS = Object.freeze([429, 500, 503, 504]);
+
 function defaultShouldFallback(err, policy) {
-  const codes = (policy && policy.fallbackOnStatus) || [429];
+  const codes = (policy && policy.fallbackOnStatus) || DEFAULT_FALLBACK_STATUS;
   return codes.includes(err && err.status);
 }
 
@@ -151,4 +158,4 @@ function safeStringify(value) {
   try { return JSON.stringify(value); } catch (e) { return String(value); }
 }
 
-module.exports = { callWithFallback, toProviderCallRow };
+module.exports = { callWithFallback, toProviderCallRow, DEFAULT_FALLBACK_STATUS };

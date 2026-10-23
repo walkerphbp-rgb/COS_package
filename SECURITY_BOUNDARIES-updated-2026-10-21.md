@@ -84,9 +84,9 @@ This is the architectural principle Test 17 exists to demonstrate:
 
 ## 12. Fallback behavior
 
-- `[TESTED]` Gemini is always attempted first; Groq is only used when the shouldFallback policy (default: HTTP 429) is met, per-call, non-sticky (Tests 16, 16 v2, both mock; Test 16's original also confirmed live).
+- `[TESTED]` Gemini is always attempted first; Groq is only used when the shouldFallback policy (default: HTTP 429, 500, 503, 504) is met, per-call, non-sticky (Tests 16, 16 v2, both mock; Test 16's original also confirmed live).
 - `[TESTED]` A provider switch never happens silently — every call, fallback or not, is logged with `provider_attempted`, `provider_used`, `attempted_status_code`, and `injected_failure` in `provider_calls`.
-- `[PRODUCTION REQUIREMENT]` The fallback policy only recognizes HTTP 429. Other real failure modes (timeouts, 5xx, malformed JSON that fails schema validation) do not currently trigger fallback — they surface as hard errors. Whether that's correct behavior or needs its own fallback path is a product decision, not yet made.
+- `[PRODUCTION REQUIREMENT]` The default fallback policy covers HTTP 429, 500, 503 and 504; 400/401/403/404 never fall back. Still not covered: timeouts and network errors (no status code; the provider `fetch` calls have no timeout, so a hung request never falls back) and malformed JSON from Gemini, which surface as hard errors. Whether those need their own fallback path is a product decision, not yet made.
 
 ## 13. What the LLM is explicitly NOT allowed to do
 

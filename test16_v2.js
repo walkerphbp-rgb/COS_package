@@ -6,15 +6,16 @@
  * Rows are written with the same INSERT mission_chain.js uses (runProviderCall).
  *
  * Statuses: PASS / FAIL. Items tagged [PINNED] record CURRENT behaviour that is a known
- * gap (e.g. no fallback on Gemini 503). They PASS when behaviour matches what is documented;
- * they are not endorsements. If you later add 503 fallback, expect V9/V13 to FAIL on purpose.
+ * gap (e.g. no fallback on malformed JSON). They PASS when behaviour matches what is documented;
+ * they are not endorsements. Default fallback statuses are 429, 500, 503, 504 (see
+ * DEFAULT_FALLBACK_STATUS in provider_fallback.js); 400/401/403/404 and other codes never fall back.
  *
  * Usage: node test16_v2.js   (Node 22.5+; files test16_schema.sql + provider_fallback.js alongside)
  */
 'use strict';
 const { DatabaseSync } = require('node:sqlite');
 const fs = require('fs'), path = require('path'), crypto = require('crypto');
-const { callWithFallback, toProviderCallRow } = require('./provider_fallback');
+const { callWithFallback, toProviderCallRow, DEFAULT_FALLBACK_STATUS } = require('./provider_fallback');
 
 const DB_PATH = path.join(__dirname, 'test16_v2.db');
 if (fs.existsSync(DB_PATH)) fs.unlinkSync(DB_PATH);
@@ -98,15 +99,46 @@ const rec = (id, pass, detail, tag = '') => R.push({ id, status: pass ? 'PASS' :
   e = await expectThrow(() => runCall(91, [g, q]));
   rec('V8_gemini429_groq500_throws_500', !!e && e.status === 500, `threw=${e && e.status}`);
 
-  // V9 [PINNED] Gemini 503 with Groq configured: NO fallback, throws 503, Groq untouched
+  // V9 Gemini 503 with Groq configured: falls back, 503 recorded (the Oct failures f4c9d7bd/8a4550e1)
   g = stub('gemini', fail(503)); q = stub('groq', ok('groq'));
-  e = await expectThrow(() => runCall(92, [g, q]));
-  rec('V9_gemini_503_no_fallback', !!e && e.status === 503 && q.calls === 0, `threw=${e && e.status} groq_calls=${q.calls}`, 'PINNED known gap: matches failed missions f4c9d7bd/8a4550e1');
+  ({ row } = await runCall(92, [g, q]));
+  rec('V9_gemini_503_falls_back_to_groq', row.provider_used === 'groq' && row.fallback_triggered === 1 && row.attempted_status_code === 503 && row.schema_valid === 1 && g.calls === 1 && q.calls === 1,
+    `used=${row.provider_used} fb=${row.fallback_triggered} status=${row.attempted_status_code} gemini_calls=${g.calls} groq_calls=${q.calls}`);
 
-  // V10 policy knob: fallbackOnStatus [429,503] makes 503 fall back (proves a fix is a policy change)
+  // V9a 500 and 504 also fall back
+  for (const code of [500, 504]) {
+    g = stub('gemini', fail(code)); q = stub('groq', ok('groq'));
+    ({ row } = await runCall(920 + code, [g, q]));
+    rec(`V9a_gemini_${code}_falls_back`, row.provider_used === 'groq' && row.attempted_status_code === code && q.calls === 1, `used=${row.provider_used} status=${row.attempted_status_code}`);
+  }
+
+  // V9b client/auth errors never fall back: Groq untouched, the real error surfaces
+  for (const code of [400, 401, 403, 404]) {
+    g = stub('gemini', fail(code)); q = stub('groq', ok('groq'));
+    e = await expectThrow(() => runCall(930 + code, [g, q]));
+    rec(`V9b_gemini_${code}_does_not_fall_back`, !!e && e.status === code && q.calls === 0, `threw=${e && e.status} groq_calls=${q.calls}`);
+  }
+
+  // V9c 502 is outside the default list: no fallback (documented; widen via policy if wanted)
+  g = stub('gemini', fail(502)); q = stub('groq', ok('groq'));
+  e = await expectThrow(() => runCall(940, [g, q]));
+  rec('V9c_gemini_502_outside_default_list', !!e && e.status === 502 && q.calls === 0, `threw=${e && e.status} groq_calls=${q.calls}`, 'PINNED: 502 not in default list');
+
+  // V9d 503 on both providers: throws Groq's 503, each called exactly once, no retry loop
+  g = stub('gemini', fail(503)); q = stub('groq', fail(503));
+  e = await expectThrow(() => runCall(941, [g, q]));
+  rec('V9d_both_503_throws_no_loop', !!e && e.status === 503 && g.calls === 1 && q.calls === 1, `threw=${e && e.status} gemini_calls=${g.calls} groq_calls=${q.calls}`);
+
+  // V9e the default list is exactly what we intend (guards silent drift)
+  rec('V9e_default_status_list', JSON.stringify([...DEFAULT_FALLBACK_STATUS]) === JSON.stringify([429, 500, 503, 504]), `default=${JSON.stringify([...DEFAULT_FALLBACK_STATUS])}`);
+
+  // V10 policy override still works both ways: [429] restores the old narrow behaviour, [429,502] widens it
   g = stub('gemini', fail(503)); q = stub('groq', ok('groq'));
-  ({ row } = await runCall(93, [g, q], { fallbackOnStatus: [429, 503] }));
-  rec('V10_policy_can_enable_503_fallback', row.provider_used === 'groq' && row.attempted_status_code === 503, `used=${row.provider_used} status=${row.attempted_status_code}`);
+  e = await expectThrow(() => runCall(93, [g, q], { fallbackOnStatus: [429] }));
+  rec('V10a_override_narrow_429_only', !!e && e.status === 503 && q.calls === 0, `threw=${e && e.status} groq_calls=${q.calls}`);
+  g = stub('gemini', fail(502)); q = stub('groq', ok('groq'));
+  ({ row } = await runCall(942, [g, q], { fallbackOnStatus: [429, 502] }));
+  rec('V10b_override_widen_to_502', row.provider_used === 'groq' && row.attempted_status_code === 502, `used=${row.provider_used} status=${row.attempted_status_code}`);
 
   // V11 [PINNED] malformed JSON from Gemini (SyntaxError, no status): no fallback
   g = stub('gemini', () => JSON.parse('{not json')); q = stub('groq', ok('groq'));
