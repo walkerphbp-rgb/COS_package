@@ -48,3 +48,5 @@ jobs:
         run: node test29_b2_backup.js
       - name: Run 30 (recovery check page logic)
         run: node test30_recovery_check.js
+      - name: Run 16 v2 (provider fallback, real module)
+        run: node test16_v2.js
