@@ -48,9 +48,20 @@ const DEFAULT_FALLBACK_STATUS = Object.freeze([429, 500, 503, 504]);
  * from a real 504 without a schema change. It is deliberately NOT in DEFAULT_FALLBACK_STATUS:
  * timeouts are matched by err.code below, so the status list (and its tests) stay as they were. */
 const TIMEOUT_STATUS = 598;
+/* Transport-level failures (no HTTP status from the provider) are tagged at the source in mission_chain.js
+ * (err.code) and get their own synthetic markers, so provider_calls.attempted_status_code stays informative:
+ *   597 provider_network_error  fetch itself failed (DNS, reset, TLS) or the body stream broke
+ *   596 provider_bad_json       200 OK but the HTTP body, or the model's JSON text, would not parse
+ * Untagged errors (programmer bugs, unknown throws) never fall back. */
+const NETWORK_ERROR_STATUS = 597;
+const BAD_JSON_STATUS = 596;
+const DEFAULT_FALLBACK_ERROR_CODES = Object.freeze(['provider_timeout', 'provider_network_error', 'provider_bad_json']);
 
 function defaultShouldFallback(err, policy) {
-  if (err && err.code === 'provider_timeout') return !(policy && policy.fallbackOnTimeout === false);
+  if (err && DEFAULT_FALLBACK_ERROR_CODES.includes(err.code)) {
+    if (err.code === 'provider_timeout' && policy && policy.fallbackOnTimeout === false) return false;
+    return true;
+  }
   const codes = (policy && policy.fallbackOnStatus) || DEFAULT_FALLBACK_STATUS;
   return codes.includes(err && err.status);
 }
@@ -97,6 +108,8 @@ async function callWithFallback(task, providers, policy) {
   let lastStatus = null;
   let injectedFailure = false;
   let lastSchemaInvalidResponse = null;
+  // Every failed attempt, kept so a fallback (or a final failure) never hides why the earlier provider failed.
+  const failures = [];
 
   for (let i = 0; i < providers.length; i++) {
     const provider = providers[i];
@@ -118,6 +131,7 @@ async function callWithFallback(task, providers, policy) {
 
       if (!valid) {
         lastSchemaInvalidResponse = response;
+        failures.push({ provider: provider.name, status: null, code: 'schema_invalid', message: 'response failed validate()' });
         if (!isLast) {
           // Treat a schema-invalid response as a reason to try the next
           // provider, same as a thrown error would be.
@@ -135,6 +149,7 @@ async function callWithFallback(task, providers, policy) {
           injectedFailure,
           schemaValid: 0,
           rawOutput: safeStringify(response),
+          fallbackReasons: failures.slice(),
         };
       }
 
@@ -147,13 +162,17 @@ async function callWithFallback(task, providers, policy) {
         injectedFailure,
         schemaValid: 1,
         rawOutput: safeStringify(response),
+        fallbackReasons: failures.slice(),
       };
     } catch (err) {
       lastStatus = (err && err.status) || lastStatus;
+      failures.push({ provider: provider.name, status: (err && err.status) || null, code: (err && err.code) || null, message: String((err && err.message) || err) });
       const canFallback = !isLast && shouldFallback(err, policy);
       if (!canFallback) {
         // Nothing left to try (or policy says don't fall back for this
-        // error) — surface the real error rather than fabricating success.
+        // error) — surface the real error rather than fabricating success. Same error object and message as
+        // before; err.attempts lists every provider's failure (including earlier ones) for observability.
+        if (err && typeof err === 'object') { try { err.attempts = failures.slice(); } catch (e) { /* frozen error: leave it */ } }
         throw err;
       }
       // else: loop continues to the next provider
@@ -189,4 +208,4 @@ function safeStringify(value) {
   try { return JSON.stringify(value); } catch (e) { return String(value); }
 }
 
-module.exports = { callWithFallback, toProviderCallRow, DEFAULT_FALLBACK_STATUS, TIMEOUT_STATUS };
+module.exports = { callWithFallback, toProviderCallRow, DEFAULT_FALLBACK_STATUS, DEFAULT_FALLBACK_ERROR_CODES, TIMEOUT_STATUS, NETWORK_ERROR_STATUS, BAD_JSON_STATUS };
