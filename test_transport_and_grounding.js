@@ -175,6 +175,37 @@ T('C5 HTTP error page is NOT a fetch failure (behaviour unchanged: proceeds, nev
   const g = await fetchGrounding('https://seed.test/a'); assert.ok(!g.fetchFailed && g.statusCode === 404 && g.error === 'http 404' && g.bytes > 0);
 });
 
+// json()-only response mocks (no text()): the grounding body reader must tolerate them without weakening fail-closed behaviour.
+const jsonOnly = (status, val) => ({ ok: status >= 200 && status < 300, status, json: async () => val });
+T('C6 json()-only mock: body read via json(), not flagged as failed', async () => {
+  setFetch({ seed: async () => jsonOnly(200, { page: 'hello world' }) });
+  const g = await fetchGrounding('https://seed.test/a');
+  assert.ok(!g.fetchFailed && g.statusCode === 200 && g.error === null && g.content === '{"page":"hello world"}' && g.bytes === g.content.length, JSON.stringify(g));
+});
+T('C7 json()-only mock with malformed JSON: fails closed (fetchFailed, not timedOut, no content)', async () => {
+  setFetch({ seed: async () => ({ ok: true, status: 200, json: async () => JSON.parse('{"page": tru') }) });
+  const g = await fetchGrounding('https://seed.test/a');
+  assert.ok(g.fetchFailed && !g.timedOut && g.statusCode === 0 && g.bytes === 0 && g.content === '' && /JSON/.test(g.error), JSON.stringify(g));
+});
+T('C8 text() body read failure (non-timeout): fails closed, classified as fetch failure not timeout', async () => {
+  setFetch({ seed: async () => ({ ok: true, status: 200, text: async () => { throw new Error('terminated'); } }) });
+  const g = await fetchGrounding('https://seed.test/a');
+  assert.ok(g.fetchFailed && !g.timedOut && g.statusCode === 0 && g.content === '' && g.error === 'terminated', JSON.stringify(g));
+});
+T('C9 stalled json() body read is also bounded by the timeout', async () => {
+  setFetch({ seed: async (_u, opts) => ({ ok: true, status: 200, json: () => new Promise((_, rej) => opts.signal.addEventListener('abort', () => rej(opts.signal.reason))) }) });
+  const t0 = Date.now(); const g = await fetchGrounding('https://seed.test/a', 50); const dt = Date.now() - t0;
+  assert.ok(g.fetchFailed && g.timedOut && g.statusCode === 0 && g.content === '', JSON.stringify(g)); assert.ok(dt < 500, `elapsed ${dt}`);
+});
+T('C10 when both exist, text() is used and json() is never called (real-fetch behaviour preserved)', async () => {
+  setFetch({ seed: async () => ({ ok: true, status: 200, text: async () => 'raw text body', json: async () => { throw new Error('json() must not be called'); } }) });
+  const g = await fetchGrounding('https://seed.test/a'); assert.ok(!g.fetchFailed && g.content === 'raw text body');
+});
+T('C11 json()-only HTTP 404: still not a fetch failure (unchanged), never grounded', async () => {
+  setFetch({ seed: async () => jsonOnly(404, 'Not found page') });
+  const g = await fetchGrounding('https://seed.test/a'); assert.ok(!g.fetchFailed && g.statusCode === 404 && g.error === 'http 404' && g.bytes > 0);
+});
+
 // ---- D. runResearcher: fetch failure stops the mission before any model call -------------------------------
 const SEED = 'https://seed.test/doc', NONCE = 'N0NCE', SNIP = 'The Chief of Staff refuses to execute anything without a human issued approval row in the decisions table.';
 function newDb() {
@@ -224,6 +255,33 @@ T('D5 Gemini network failure inside runResearcher falls back to Groq and the mis
   const db = newDb(); const r = await research(db);
   assert.strictEqual(r.fallbackTriggered, true); assert.strictEqual(r.providerUsed, 'groq');
   const row = db.prepare('SELECT * FROM provider_calls').get(); assert.strictEqual(row.fallback_triggered, 1); assert.strictEqual(row.attempted_status_code, 597);
+});
+T('D5b json()-only seed with malformed JSON: mission stops (grounding_fetch_failed), no model call, nothing persisted but the failure log', async () => {
+  setFetch({ seed: async () => ({ ok: true, status: 200, json: async () => JSON.parse('{"x": ') }), gemini: goodModel, groq: async () => groqOk({}) });
+  const db = newDb();
+  await assert.rejects(research(db), (e) => e.code === 'grounding_fetch_failed' && /no verified evidence/.test(e.message));
+  assert.deepStrictEqual(calls, ['seed']);
+  assert.strictEqual(count(db, 'provider_calls'), 0); assert.strictEqual(count(db, 'claims'), 0);
+  assert.strictEqual(db.prepare(`SELECT COUNT(*) AS n FROM decisions WHERE status='RESEARCHED'`).get().n, 0);
+  const fl = db.prepare('SELECT * FROM fetch_log').all(); assert.strictEqual(fl.length, 1); assert.strictEqual(fl[0].status_code, 0);
+});
+T('D5c text() body read failure mid-stream: mission stops (grounding_fetch_failed, not grounding_timeout), no model call', async () => {
+  setFetch({ seed: async () => ({ ok: true, status: 200, text: async () => { throw new Error('terminated'); } }), gemini: goodModel, groq: async () => groqOk({}) });
+  const db = newDb();
+  await assert.rejects(research(db), (e) => e.code === 'grounding_fetch_failed' && !/timed out/.test(e.message));
+  assert.deepStrictEqual(calls, ['seed']); assert.strictEqual(count(db, 'provider_calls'), 0); assert.strictEqual(count(db, 'claims'), 0);
+});
+T('D5d json()-only seed that stalls: mission stops with grounding_timeout, no model call', async () => {
+  setFetch({ seed: async (_u, opts) => ({ ok: true, status: 200, json: () => new Promise((_, rej) => opts.signal.addEventListener('abort', () => rej(opts.signal.reason))) }), gemini: goodModel, groq: async () => groqOk({}) });
+  const db = newDb();
+  await assert.rejects(research(db), (e) => e.code === 'grounding_timeout');
+  assert.deepStrictEqual(calls, ['seed']); assert.strictEqual(count(db, 'provider_calls'), 0); assert.strictEqual(count(db, 'claims'), 0);
+});
+T('D5e json()-only healthy seed: proceeds, claim grounded against the body as read', async () => {
+  setFetch({ seed: async () => jsonOnly(200, `Intro. ${SNIP} Outro.`), gemini: goodModel, groq: async () => groqOk({}) });
+  const db = newDb(); const r = await research(db);
+  assert.strictEqual(r.claimIds.length, 1); assert.strictEqual(db.prepare('SELECT fetch_match FROM claims').get().fetch_match, 1);
+  assert.deepStrictEqual(calls, ['seed', 'gemini']);
 });
 T('D6 no unhandled rejections anywhere in this file', async () => { await sleep(100); assert.strictEqual(unhandled.length, 0, String(unhandled[0])); });
 

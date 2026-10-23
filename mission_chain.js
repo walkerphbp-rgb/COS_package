@@ -87,12 +87,13 @@ async function liveFetch(label, url, opts) {
     throw providerError('provider_network_error', label, (e && e.message) || String(e), e);
   }
 }
+// Real fetch responses always have text(); tolerate json()-only test mocks. Any read error propagates to the caller.
+async function readResponseText(res) {
+  return typeof res.text === 'function' ? await res.text() : JSON.stringify(await res.json());
+}
 async function readBodyJson(label, res, signal) {
   let text;
-  try {
-    // Real fetch responses always have text(); tolerate json()-only test mocks.
-    text = typeof res.text === 'function' ? await res.text() : JSON.stringify(await res.json());
-  }
+  try { text = await readResponseText(res); }
   catch (e) {
     if (signal && signal.aborted) throw e;
     throw providerError('provider_network_error', label, `response body read failed: ${(e && e.message) || e}`, e);
@@ -211,7 +212,7 @@ const GROUNDING_TIMEOUT_MS = Number(process.env.GROUNDING_TIMEOUT_MS) || 15000;
 async function fetchGrounding(seedUrl, timeoutMs = GROUNDING_TIMEOUT_MS) {
   try {
     const res = await fetch(seedUrl, { signal: AbortSignal.timeout(timeoutMs) });
-    const content = await res.text();
+    const content = await readResponseText(res);
     return { statusCode: res.status, bytes: content.length, error: res.ok ? null : `http ${res.status}`, content };
   } catch (e) {
     // fetchFailed = the fetch itself failed or timed out (no HTTP response). An HTTP error page is NOT this case.
