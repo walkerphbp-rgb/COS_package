@@ -34,7 +34,7 @@ index 685d416..3b953f1 100644
  
  # /data is where the SQLite file lives. Mount a PERSISTENT VOLUME here or every redeploy starts empty.
 diff --git a/SECURITY_BOUNDARIES.md b/SECURITY_BOUNDARIES.md
-index d8b7515..9a93afb 100644
+index d8b7515..3f74cfc 100644
 --- a/SECURITY_BOUNDARIES.md
 +++ b/SECURITY_BOUNDARIES.md
 @@ -139,3 +139,20 @@ Status tags here refer to `cos_backend_smoke.js` (33 checks, run against a seede
@@ -50,7 +50,7 @@ index d8b7515..9a93afb 100644
 +
 +- `[PROVEN-STUBBED]` Research is OFF unless `COS_RESEARCH_HOSTS` is set (exact hostnames; anything else refuses to boot, exit 5). A request with `research` while disabled gets 400 `RESEARCH_DISABLED`; malformed research gets 400 `RESEARCH_INVALID` and never falls back to the seed document; absent research uses the legacy seed route, labelled `legacy_seed_demo`. Research missions are ask-mode only (400 `RESEARCH_ASK_ONLY`). (Test 33 part 1, J)
 +- `[PROVEN-STUBBED]` URL policy: https only, no userinfo, default port only, no IP literals, exact hostnames. Effective allowlist = operator list AND format `evidence.source_domains` when non-empty; neither widens the other, including across redirects. Every hop is re-validated and re-resolved, any private/special DNS answer refuses, the connection is pinned via `lookup`, and the remote address is compared after connect. Max 3 redirects, 1 MiB download, 15 s per call. (Test 33 A-D, E-G)
-+- `[LIVE-VALIDATION PENDING]` The real `httpsTransport` (real TLS, real DNS, real redirects, real connected-address check) has not been exercised. Stubs replace the transport in every test.
++- `[LIVE-FETCH PASSED 2026-10-25, 11/11, `test33_live_fetch.js`, run from the build sandbox, NOT in CI]` The real `httpsTransport` ran against public GitHub hosts: real TLS and DNS, `rawSha256` equal to an independent fetch of the same bytes, connected address public and among the resolver answers, a real github.com to raw.githubusercontent.com redirect followed when both hosts are allowed and refused when the target is not allowed or is excluded by format `source_domains`, a real 404 refused, download and model-text bounds, and a 1 ms timeout. Mutations (wrong hash bytes, redirect hop not re-validated) make it fail. `[LIVE-VALIDATION PENDING]` for everything this did not reach: the `DEST_MISMATCH` branch (cannot be triggered live, covered only by stubs), `DNS_PRIVATE_ADDRESS`, TLS certificate errors, non-GitHub hosts, running from the Render instance, and any real model run.
 +- `[PROVEN-STUBBED]` Each source gets a stable `source_id` (S1..Sn). Claims cite `source_id`; grounding checks only the cited source's stored model text, with no cross-source matching. Zero readable sources fails the mission before any model call. (Test 33 I, E-G)
 +- `[PROVEN-STUBBED]` Stored per source: bounded extracted text actually given to the model, `rawSha256` (downloaded bytes, not recomputable later) and `textSha256` (model text, recomputed by `researchView`), plus download-truncation and model-truncation flags, attempted/retrieved timestamps. A tampered stored text or hash is detected. A hash alone does not allow evidence reconstruction, which is why the text is stored.
 +- `[PROVEN-STUBBED]` Risk can only rise: a failed or truncated source raises the tier to at least MEDIUM; the deterministic classifier stays authoritative. Instruction-like text in a source is advisory only and never changes a tier. The pattern list is incomplete: "ignore all previous instructions" is NOT matched (pinned as check G12, fix deferred by decision).
@@ -1032,10 +1032,10 @@ index 0000000..983708f
 +})().catch((e) => { console.error(e); process.exit(2); });
 diff --git a/test33_chain.js b/test33_chain.js
 new file mode 100644
-index 0000000..01e401e
+index 0000000..ff0cc0c
 --- /dev/null
 +++ b/test33_chain.js
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,125 @@
 +'use strict';
 +/* Test 33 group I: multi-source Researcher in the real mission_chain (Step 3, item 2).
 + * STUBBED ONLY: sources come from an injected transport + resolver (no network), the model is a stub (no live model).
@@ -1112,6 +1112,10 @@ index 0000000..01e401e
 +  check('I8 a claim citing an unknown or empty source_id is not grounded', y.claims.length === 2 && y.claims.every((c) => c.fetch_match === 0));
 +  const z = await run({ request: mkReq([U1, U2]), table: good, claims: [{ text: 'Tail faked.', source_id: 'S1', snippet: 'requires written approval from two named reviewers and an invented tail' }] });
 +  check('I9 the WHOLE snippet must be inside the cited source (real opening + invented tail fails)', z.claims[0].fetch_match === 0);
++  // I9b direct unit check: the grounding function itself refuses a source/claim id mismatch (the caller's byId lookup alone must not be the only guard)
++  const _src = { source_id: 'S1', ok: true, text: 'Alpha requires written approval from two named reviewers before release.' };
++  const _snip = 'requires written approval from two named reviewers';
++  check('I9b isGroundedInSource itself refuses a claim whose source_id differs from the source it is given', chain.isGroundedInSource(_src, { source_id: 'S1', evidence_snippet: _snip }) === true && chain.isGroundedInSource(_src, { source_id: 'S2', evidence_snippet: _snip }) === false);
 +
 +  // I10 failed source: partial evidence continues, failure recorded, risk rises, prompt says unavailable
 +  const f = await run({ request: mkReq([U1, U3]), table: { [U1]: { body: T1 }, [U3]: { status: 500, body: 'boom' } }, claims: [{ text: 'Alpha needs two reviewers.', source_id: 'S1', snippet: 'requires written approval from two named reviewers' }, { text: 'Cited the failed one.', source_id: 'S2', snippet: 'boom' }] });
@@ -1345,6 +1349,62 @@ index 0000000..0b47964
 +  console.log(`\nTEST33-EFG (STUBBED sources + STUBBED model, no network) result=${fail ? 'FAIL' : 'PASS'} passed=${pass} failed=${fail}`);
 +  process.exit(fail ? 1 : 0);
 +})().catch((e) => { console.error('HARNESS ERROR', e); process.exit(2); });
+diff --git a/test33_live_fetch.js b/test33_live_fetch.js
+new file mode 100644
+index 0000000..7e1ee54
+--- /dev/null
++++ b/test33_live_fetch.js
+@@ -0,0 +1,50 @@
++'use strict';
++/* Test 33 LIVE-FETCH: exercises the REAL safe_fetch transport (real DNS, real TLS, real redirects, real connected-address check)
++ * against public GitHub hosts. NO model is called. This needs outbound network, so it is NOT part of npm test or CI.
++ * Run: node test33_live_fetch.js        Result lines: PASS / FAIL / INCONCLUSIVE (network unreachable). */
++const crypto = require('crypto'), dns = require('dns');
++const SF = require('./safe_fetch');
++let pass = 0, fail = 0, inc = 0;
++const rec = (st, id, d) => { st === 'PASS' ? pass++ : st === 'FAIL' ? fail++ : inc++; console.log(`${st}  ${id}${d ? '  -> ' + String(d).slice(0, 240) : ''}`); };
++const check = (id, ok, d) => rec(ok ? 'PASS' : 'FAIL', id, ok ? '' : d);
++const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
++const RAW = 'https://raw.githubusercontent.com/anthropics/anthropic-sdk-typescript/main/README.md';
++const VIA = 'https://github.com/anthropics/anthropic-sdk-typescript/raw/main/README.md';
++(async () => {
++  // Reachability gate: if the direct fetch cannot even reach the network, results are INCONCLUSIVE, never a pass.
++  const a = await SF.safeFetch(RAW, { operatorHosts: ['raw.githubusercontent.com'] });
++  if (!a.ok && ['DNS_FAILED', 'FETCH_ERROR', 'TIMEOUT'].includes(a.code)) { rec('INCONCLUSIVE', 'network not reachable from here', `${a.code} ${a.detail}`); return done(); }
++  check('L1 real fetch of a raw file succeeds (https, real TLS, real DNS)', a.ok && a.status === 200 && /^text\//.test(a.contentType || '') && a.textChars > 500, JSON.stringify({ code: a.code, d: a.detail, s: a.status, ct: a.contentType }));
++  // L2 independent check: raw hash equals the SHA-256 of the bytes fetched by a second, unrelated client
++  const ref = Buffer.from(await (await fetch(RAW, { headers: { 'accept-encoding': 'identity' } })).arrayBuffer());
++  check('L2 rawSha256 equals the hash of the same bytes fetched independently', !a.downloadTruncated && a.rawSha256 === sha(ref) && a.bytesDownloaded === ref.length, `${a.bytesDownloaded} vs ${ref.length}`);
++  // L3 connected address is a real public address that the resolver itself returned for that host
++  const ips = (await dns.promises.lookup('raw.githubusercontent.com', { all: true })).map((x) => x.address);
++  check('L3 connectedIp is public and one of the resolver answers', !!a.connectedIp && !SF.isBlockedIp(a.connectedIp) && ips.includes(a.connectedIp), `${a.connectedIp} in ${ips}`);
++  // L4 real cross-host redirect followed when BOTH hosts are allowed
++  const b = await SF.safeFetch(VIA, { operatorHosts: ['github.com', 'raw.githubusercontent.com'] });
++  check('L4 github.com -> raw.githubusercontent.com redirect is followed, final URL on the second host', b.ok && b.redirects.length >= 1 && /^https:\/\/raw\.githubusercontent\.com\//.test(b.finalUrl || '') && b.rawSha256 === a.rawSha256, JSON.stringify({ code: b.code, d: b.detail, r: b.redirects, f: b.finalUrl }));
++  // L5 same redirect REFUSED when the target host is not allowed (allowlist re-checked on the real hop)
++  const c = await SF.safeFetch(VIA, { operatorHosts: ['github.com'] });
++  check('L5 redirect to a host outside the allowlist is refused and no text is returned', !c.ok && c.text === '' && c.redirects.length >= 1 && /redirect hop 1/.test(c.detail || ''), JSON.stringify({ code: c.code, d: c.detail }));
++  // L6 format hosts narrow the operator list (intersection) on the real hop too
++  const d = await SF.safeFetch(VIA, { operatorHosts: ['github.com', 'raw.githubusercontent.com'], formatHosts: ['github.com'] });
++  check('L6 format source_domains narrow the operator list: redirect target refused', !d.ok && d.text === '', JSON.stringify({ code: d.code, d: d.detail }));
++  // L7 host not allowed at all: refused before any connection
++  const e = await SF.safeFetch('https://example.com/', { operatorHosts: ['github.com'] });
++  check('L7 a non-allowlisted host is refused without connecting', !e.ok && e.connectedIp === null, JSON.stringify({ code: e.code, ip: e.connectedIp }));
++  // L8 HTTP error status
++  const f = await SF.safeFetch('https://raw.githubusercontent.com/anthropics/anthropic-sdk-typescript/main/NO_SUCH_FILE_COS_TEST.md', { operatorHosts: ['raw.githubusercontent.com'] });
++  check('L8 a real 404 is refused with HTTP_STATUS and no text', !f.ok && f.code === 'HTTP_STATUS' && f.text === '', JSON.stringify({ code: f.code, d: f.detail }));
++  // L9 download bound: real server, tiny maxBytes
++  const g = await SF.safeFetch(RAW, { operatorHosts: ['raw.githubusercontent.com'], maxBytes: 2000 });
++  check('L9 download is cut at maxBytes and flagged truncated', g.ok && g.bytesDownloaded === 2000 && g.downloadTruncated === true, JSON.stringify({ ok: g.ok, b: g.bytesDownloaded, t: g.downloadTruncated, c: g.code }));
++  // L10 model-context bound is reported separately from the download bound
++  const h = await SF.safeFetch(RAW, { operatorHosts: ['raw.githubusercontent.com'], maxModelChars: 300 });
++  check('L10 model-text cut at maxModelChars is flagged separately from download truncation', h.ok && h.textChars <= 300 && h.modelTruncated === true && h.downloadTruncated === false, JSON.stringify({ n: h.textChars, m: h.modelTruncated, d: h.downloadTruncated }));
++  // L11 whole-call timeout on the real transport
++  const t0 = Date.now(), i = await SF.safeFetch(RAW, { operatorHosts: ['raw.githubusercontent.com'], timeoutMs: 1 });
++  check('L11 a 1 ms timeout aborts the real request with TIMEOUT', !i.ok && i.code === 'TIMEOUT' && Date.now() - t0 < 3000, JSON.stringify({ code: i.code, ms: Date.now() - t0 }));
++  done();
++})().catch((e) => { console.log('FAIL  unexpected error', e && e.stack); process.exitCode = 1; });
++function done() { console.log(`\nTEST33-LIVE-FETCH (real transport, public GitHub hosts, NO model) result=${fail ? 'FAIL' : inc ? 'INCONCLUSIVE' : 'PASS'} passed=${pass} failed=${fail} inconclusive=${inc}`); if (fail) process.exitCode = 1; }
 diff --git a/test33_report.js b/test33_report.js
 new file mode 100644
 index 0000000..9f8b7e2
