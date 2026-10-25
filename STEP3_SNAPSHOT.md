@@ -1,3 +1,30 @@
+# COS Step 3 STOPPED HERE (2026-10-25): NEXT ACTION
+
+**State:** Step 3 (source-based research, schema v4) is complete on scratch branch `step3-research` (from `6542e37`), stubbed/local plus one live-fetch test. GitHub `main` = `6542e37`, untouched. GitHub holds only `step3_wip.patch` + this file (stored, never applied), Actions green. Nothing committed, pushed or deployed.
+
+**DELTAS NOT IN step3_wip.patch (all session outputs, stored only):** `netcheck_delta.patch` (adds `test33_net_hardening.js`, SECURITY_BOUNDARIES section 17 additions, snapshot notes) and `test22_harness_fix.patch` (test22 + CI step). Tree of record = `step3-research.working-netcheck.zip` (has net-hardening) + `test22_harness_fix.patch` applied on top. Open defect E8 (IPv6-first answer on a runtime without IPv6 raises an uncaught EAFNOSUPPORT) is NOT fixed.
+
+**Evidence:** 23 CI steps exit 0; Test 33 = 56/20/22/23/33/18 (stubbed/local); `test33_live_fetch.js` 11/11 (real GitHub hosts, no model, not in CI); `test20` mutation detects, Step 3 mutations detected; patch applies cleanly on `6542e37`.
+
+**NET-HARDENING RESULT (2026-10-25, isolated copy of the recovery zip):** `test33_net_hardening.js` PASS 39 / FAIL 1 / INCONCLUSIVE 2; manual (root + openssl + network), not in CI. FAIL E8 = real open defect: an IPv6-first DNS answer on a runtime without IPv6 makes the real transport raise an uncaught EAFNOSUPPORT (process-killing; no uncaughtException handler exists) as well as returning FETCH_ERROR; reproduced without instrumentation; NOT fixed. INCONCLUSIVE: E7 live IPv6 (sandbox has none), J5 origin cert mismatch (sandbox is behind a TLS-intercepting gateway that mints trusted certs for any name; this also means all earlier [NET]/live-fetch results verified the gateway cert, not the origin's). Everything else proven at socket level incl. private/mixed/malformed DNS, rebinding, redirect limits, disallowed redirect targets, local TLS cert errors; 9 mutations caught. Details in SECURITY_BOUNDARIES.md section 17.
+
+**Known open items (none authorized):**
+0. FIX DECISION for E8 (and consider trying more than the first DNS answer). Re-run test33_live_fetch.js and test33_net_hardening.js from Render for origin-level evidence.
+1. RESOLVED in a delta only (`test22_harness_fix.patch`, not in the main tree or step3_wip.patch): `test22_grounding.js` copies the whole runtime tree, harness errors exit 2 vs detection exit 1 + `MUTATION-DETECTED` line, G6 + isGrounded unit checks U0-U7, CI step requires exit 1 AND that line. Corrected 23/23; original detected (also on baseline 6542e37); 9 mutations caught. test20's mutation step still uses the older any-nonzero pattern (it does detect today).
+2. `INJECTION_PATTERNS` misses "ignore all previous instructions" (pinned as G12). Skipped by Paul.
+3. Not validated: real model run, Render deploy, real v3 production DB migration, old-build rollback (read from code only), DEST_MISMATCH / DNS_PRIVATE_ADDRESS / TLS errors live.
+4. Workspace form change is a separate later step (its "one server source" note becomes wrong).
+5. Three older tests (`test16_v2`, `test_provider_timeout`, `test_transport_and_grounding`) still not in `package.json`.
+
+**Next action options (ask Paul which):**
+- A. Draft a Render deploy plan (document only): use `STEP3_MIGRATION_ROLLBACK.md` section 3 (verified pre-migration B2 copy kept OUTSIDE `Cos/snapshots/`), set `COS_RESEARCH_HOSTS`, first-boot `/health` checks (schema 4/4, restore no fallback, research flag), then one live research mission with a real Gemini key. Needs explicit approval before any commit/push/deploy.
+- B. Fix the `test22` mutation step (copy `format_canon.js` into its temp dir) as its own small change.
+- C. Workspace form for research (item 4 above).
+
+**To resume:** give the new chat `step3-research.zip`, or this file plus `step3_wip.patch`. Clone https://github.com/walkerphbp-rgb/COS_package.git, `git checkout 6542e37`, `git checkout -b step3-research`, `git apply step3_wip.patch`, run all six `test33_*.js` (not the live one unless network is available), then continue from the chosen option.
+
+---
+
 # COS Step 3 continuation snapshot (2026-10-25, updated after item 7 + live-fetch test)
 
 ## Ground rules (unchanged)
