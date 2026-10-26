@@ -1,27 +1,24 @@
-# COS Step 3 STOPPED HERE (2026-10-25): NEXT ACTION
+# COS Step 3 SNAPSHOT (2026-10-26): READY TO COMMIT TO THE BRANCH, NOT TO MERGE/DEPLOY
 
-**State:** Step 3 (source-based research, schema v4) is complete on scratch branch `step3-research` (from `6542e37`), stubbed/local plus one live-fetch test. GitHub `main` = `6542e37`, untouched. GitHub holds only `step3_wip.patch` + this file (stored, never applied), Actions green. Nothing committed, pushed or deployed.
+**State:** Step 3 (source-based research, schema v4) is complete on scratch branch `step3-research` (from `6542e37`). `main` = `6542e37`, untouched. Nothing committed, pushed or deployed by me. Full diff = `step3_final.patch` (24 files, +1664/-31); full tree = `step3-research.final.zip`; original read-only recovery zip sha256 `3f441c96a666da36aaa34be7d847449f969cd7e282112d17166b023e6ea0f907` (unchanged).
 
-**DELTAS NOT IN step3_wip.patch (all session outputs, stored only):** `netcheck_delta.patch` (adds `test33_net_hardening.js`, SECURITY_BOUNDARIES section 17 additions, snapshot notes) and `test22_harness_fix.patch` (test22 + CI step). Tree of record = `step3-research.working-netcheck.zip` (has net-hardening) + `test22_harness_fix.patch` applied on top. Open defect E8 (IPv6-first answer on a runtime without IPv6 raises an uncaught EAFNOSUPPORT) is NOT fixed.
+**Evidence (final tree):** 24 CI steps green; `npm test` exit 0; Test 33 = 56/20/22/23/33/18/15 (stubbed/local, includes the new CI-safe `test33_transport_failure.js`); manual: `test33_live_fetch.js` 11/11, `test33_net_hardening.js` PASS 41 / FAIL 0 / INCONCLUSIVE 2 (socket-level proof no connection reaches an unapproved address; needs root + openssl + network). Final patch applies to a pristine `6542e37` and passes there. Baseline-vs-branch differential: 13/13 shared tables identical, same status codes, approvals/gate/audit unchanged (audit order differs only on same-second ties, also baseline vs baseline). Emulated image boots via CMD and fails if either new module is missing (no Docker daemon here, so not a real `docker build`). All mutation checks caught.
 
-**Evidence:** 23 CI steps exit 0; Test 33 = 56/20/22/23/33/18 (stubbed/local); `test33_live_fetch.js` 11/11 (real GitHub hosts, no model, not in CI); `test20` mutation detects, Step 3 mutations detected; patch applies cleanly on `6542e37`.
+**Fixed this round:** E8 (IPv6/sync connect failure => uncaught exception, process-killing) fixed at the root: pinned lookup answers via setImmediate. test22 mutation step fixed (whole runtime copied, exit 2 = harness error vs exit 1 + MUTATION-DETECTED, G6 + isGrounded unit checks U0-U7). TLS investigation closed: local cert-error servers + trust-isolated real path pass; origin-level mismatch (J5) and live IPv6 (E7) remain INCONCLUSIVE because the build sandbox is behind a TLS-intercepting gateway and has no IPv6 (all earlier [NET] results verified the gateway cert, not the origin's).
 
-**NET-HARDENING RESULT (2026-10-25, isolated copy of the recovery zip):** `test33_net_hardening.js` PASS 39 / FAIL 1 / INCONCLUSIVE 2; manual (root + openssl + network), not in CI. FAIL E8 = real open defect: an IPv6-first DNS answer on a runtime without IPv6 makes the real transport raise an uncaught EAFNOSUPPORT (process-killing; no uncaughtException handler exists) as well as returning FETCH_ERROR; reproduced without instrumentation; NOT fixed. INCONCLUSIVE: E7 live IPv6 (sandbox has none), J5 origin cert mismatch (sandbox is behind a TLS-intercepting gateway that mints trusted certs for any name; this also means all earlier [NET]/live-fetch results verified the gateway cert, not the origin's). Everything else proven at socket level incl. private/mixed/malformed DNS, rebinding, redirect limits, disallowed redirect targets, local TLS cert errors; 9 mutations caught. Details in SECURITY_BOUNDARIES.md section 17.
+**COMMIT DECISION:** READY to commit to `step3-research` as ONE commit (message in `COMMIT_MESSAGE.txt`), reviewed via PR. Do NOT include step3_wip.patch, snapshots or zips. NOT ready to merge to main or deploy until `RENDER_STAGING_CHECKLIST.md` is green: (1) staging service with its own B2 prefix and real Gemini key, (2) `render_origin_check.js` run in /app on Render (origin TLS + real IPv6), (3) verified pre-migration B2 copy kept outside `Cos/snapshots/` + rollback rehearsal on a copy of the real v3 DB. Production order: deploy with COS_RESEARCH_HOSTS UNSET (migration only), then enable ONE host.
 
-**Known open items (none authorized):**
-0. FIX DECISION for E8 (and consider trying more than the first DNS answer). Re-run test33_live_fetch.js and test33_net_hardening.js from Render for origin-level evidence.
-1. RESOLVED in a delta only (`test22_harness_fix.patch`, not in the main tree or step3_wip.patch): `test22_grounding.js` copies the whole runtime tree, harness errors exit 2 vs detection exit 1 + `MUTATION-DETECTED` line, G6 + isGrounded unit checks U0-U7, CI step requires exit 1 AND that line. Corrected 23/23; original detected (also on baseline 6542e37); 9 mutations caught. test20's mutation step still uses the older any-nonzero pattern (it does detect today).
-2. `INJECTION_PATTERNS` misses "ignore all previous instructions" (pinned as G12). Skipped by Paul.
-3. Not validated: real model run, Render deploy, real v3 production DB migration, old-build rollback (read from code only), DEST_MISMATCH / DNS_PRIVATE_ADDRESS / TLS errors live.
-4. Workspace form change is a separate later step (its "one server source" note becomes wrong).
-5. Three older tests (`test16_v2`, `test_provider_timeout`, `test_transport_and_grounding`) still not in `package.json`.
+**NEXT ACTION (pick one):** A. you commit the branch (or tell me to prepare the git commands); B. run the Render staging checklist and paste results (esp. render_origin_check.js output); C. optional later: try the next DNS answer when the first fails; Workspace form for research.
 
-**Next action options (ask Paul which):**
-- A. Draft a Render deploy plan (document only): use `STEP3_MIGRATION_ROLLBACK.md` section 3 (verified pre-migration B2 copy kept OUTSIDE `Cos/snapshots/`), set `COS_RESEARCH_HOSTS`, first-boot `/health` checks (schema 4/4, restore no fallback, research flag), then one live research mission with a real Gemini key. Needs explicit approval before any commit/push/deploy.
-- B. Fix the `test22` mutation step (copy `format_canon.js` into its temp dir) as its own small change.
-- C. Workspace form for research (item 4 above).
+**Known limits / open items (none authorized):**
+1. RESOLVED: test22 mutation step (see above). test20's mutation step still uses the older any-nonzero pattern (it does detect today).
+2. Only the first DNS answer is tried (IPv6-first host on a runtime without IPv6 fails cleanly, no IPv4 fallback).
+3. `INJECTION_PATTERNS` misses "ignore all previous instructions" (pinned as G12; skipped by decision).
+4. Access model unchanged: one workspace, every valid token reads every mission; Workspace form for research is a later step.
+5. Three older tests (`test16_v2`, `test_provider_timeout`, `test_transport_and_grounding`) still not in package.json.
+6. Not validated: real model run, Render runtime, real v3 production DB migration, old-build rollback (read from code only).
 
-**To resume:** give the new chat `step3-research.zip`, or this file plus `step3_wip.patch`. Clone https://github.com/walkerphbp-rgb/COS_package.git, `git checkout 6542e37`, `git checkout -b step3-research`, `git apply step3_wip.patch`, run all six `test33_*.js` (not the live one unless network is available), then continue from the chosen option.
+**To resume:** give a new chat `step3-research.final.zip`, or this file + `step3_final.patch` (clone https://github.com/walkerphbp-rgb/COS_package.git, `git checkout 6542e37`, `git checkout -b step3-research`, `git apply step3_final.patch`, run `npm test`).
 
 ---
 
