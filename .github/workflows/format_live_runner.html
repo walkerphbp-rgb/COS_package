@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CoS Format Live Check</title>
+<style>
+  :root { color-scheme: dark; --bg:#0e1116; --card:#171c24; --line:#2a3340; --fg:#e6edf3; --mut:#8b97a7; --ok:#3fb950; --bad:#f85149; --warn:#d29922; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
+  h1 { font-size:19px; margin:0 0 4px; } p.sub { color:var(--mut); margin:0 0 14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:12px; }
+  label { display:block; font-size:13px; color:var(--mut); margin:8px 0 4px; }
+  input { width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:#0b0e13; color:var(--fg); font-size:16px; }
+  button { padding:12px 16px; border-radius:8px; border:0; background:#2f81f7; color:#fff; font-size:16px; font-weight:600; margin-top:10px; width:100%; }
+  button.sec { background:#30363d; } button:disabled { opacity:.5; }
+  .row { display:flex; gap:8px; align-items:flex-start; padding:6px 0; border-top:1px solid var(--line); } .row:first-child { border-top:0; }
+  .ic { width:22px; flex:none; text-align:center; } .t { flex:1; } .d { color:var(--mut); font-size:13px; word-break:break-word; }
+  .PASS .ic { color:var(--ok); } .FAIL .ic { color:var(--bad); } .INCONCLUSIVE .ic, .NOTE .ic { color:var(--warn); }
+  #verdict { font-weight:700; font-size:17px; } pre { white-space:pre-wrap; word-break:break-word; font-size:12px; background:#0b0e13; padding:10px; border-radius:8px; max-height:340px; overflow:auto; }
+  .small { font-size:12px; color:var(--mut); }
+</style>
+</head>
+<body>
+<h1>Chief of Staff — Format Live Check</h1>
+<p class="sub">Runs real missions (general and smme_finance in delegate mode, plus an ask and an assist mission) and negative requests against your deployed backend, then re-reads the evidence through Decision Memory.</p>
+<div class="card">
+  <label for="base">Backend URL</label><input id="base" value="https://cos-package.onrender.com" autocapitalize="off" autocorrect="off" spellcheck="false">
+  <label for="tok">Operator token (kept only in this page; sent only to the URL above)</label><input id="tok" type="password" autocomplete="off">
+  <button id="go">Run live format check</button>
+  <p class="small"><b>Keep this page open and in front, with the screen on, until it finishes (about 3 minutes).</b> If the phone sleeps or you switch apps, requests can be dropped.</p>
+  <p class="small">Uses about 11 Gemini requests (3 per delegate or assist mission, 2 for ask). A sleeping free instance can take up to a minute to wake.</p>
+</div>
+<div class="card"><div id="verdict">Not run yet.</div><div id="checks"></div></div>
+<div class="card"><button class="sec" id="copy" disabled>Copy result JSON</button><pre id="out"></pre></div>
+
+<script id="runner">
+'use strict';
+/* All logic lives in runFormatCheck so it can be tested outside a browser (test27_format_runner.js).
+ * The page writes results with textContent only: stored text can never run as markup. */
+async function runFormatCheck(cfg, deps) {
+  const fetchFn = (deps && deps.fetch) || fetch, onCheck = (deps && deps.onCheck) || (() => {});
+  const base = String(cfg.base || '').replace(/\/+$/, ''), token = String(cfg.token || ''), epoch = String(cfg.epoch || Date.now());
+  const checks = [], data = { started: new Date().toISOString(), base, network_retries: 0 };
+  const add = (id, status, title, detail) => { const c = { id, status, title, detail: detail === undefined ? '' : String(detail).slice(0, 400) }; checks.push(c); onCheck(c); return c; };
+  async function once(method, path, body, timeoutMs) {
+    const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), timeoutMs || 120000);
+    try {
+      const r = await fetchFn(base + path, { method, signal: ctl.signal, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, body: body ? JSON.stringify(body) : undefined });
+      let j = null; try { j = await r.json(); } catch {}
+      return { status: r.status, json: j };
+    } catch (e) { return { status: 0, json: null, error: String(e && e.message || e) }; } finally { clearTimeout(t); }
+  }
+  // A status-0 result means NO HTTP response arrived (dropped connection, phone suspended the page, proxy error without CORS headers).
+  // Retry once after a short pause; every retry is counted and shown, so flakiness stays visible instead of being hidden.
+  const retryWait = (deps && deps.retryWaitMs !== undefined) ? deps.retryWaitMs : 4000; let retries = 0;
+  async function api(method, path, body, timeoutMs) {
+    let r = await once(method, path, body, timeoutMs);
+    if (r.status === 0) { retries++; await new Promise(res => setTimeout(res, retryWait)); const first = r.error; r = await once(method, path, body, timeoutMs); r.retried = true; if (r.status === 0) r.error = `${r.error} (also failed once before: ${first})`; }
+    return r;
+  }
+  const has = (a, f) => Array.isArray(a) && a.some(f);
+  const nonce = s => `LIVE_FORMAT_${epoch}_${s}`;
+
+  // ---- health
+  const h = await api('GET', '/health', null, 90000);
+  if (h.status !== 200 || !h.json) { add('L1', 'INCONCLUSIVE', 'Backend reachable', h.error || `HTTP ${h.status}`); return finish(); }
+  add('L1', 'PASS', 'Backend reachable', `version ${h.json.version}, mode ${h.json.mode}`);
+  const H = h.json;
+  add('L2', H.db && H.db.schema && H.db.schema.user_version === 4 && H.db.schema.ok && H.db.guards && H.db.guards.ok ? 'PASS' : 'FAIL', 'Schema v4 and database guards OK', H.db && JSON.stringify({ v: H.db.schema && H.db.schema.user_version, guards: H.db.guards && H.db.guards.ok }));
+  const loaded = (H.formats && H.formats.loaded) || [], hashOf = id => (loaded.find(f => f.id === id) || {}).hash;
+  add('L3', /^[0-9a-f]{64}$/.test(hashOf('general') || '') && /^[0-9a-f]{64}$/.test(hashOf('smme_finance') || '') ? 'PASS' : 'FAIL', 'Formats general and smme_finance are loaded with hashes', loaded.map(f => `${f.id}@${f.version}:${String(f.hash).slice(0, 12)}`).join(', '));
+  add('L4', H.formats && H.formats.default === 'general' ? 'PASS' : 'FAIL', 'Default format is general', H.formats && H.formats.default);
+  add('L4b', H.router && H.router.default_mode === 'ask' && H.router.default_mode_elevated === false ? 'PASS' : 'FAIL', 'Router default mode is ask (not elevated)', H.router && JSON.stringify({ default: H.router.default_mode, elevated: H.router.default_mode_elevated }));
+  data.hashes = { general: hashOf('general'), smme_finance: hashOf('smme_finance') };
+
+  // ---- mission 1: no format named => general
+  const obj = tag => `LIVE FORMAT CHECK ${tag} ${epoch}: In two sentences, explain what this SDK README is for.`;
+  const m1 = await api('POST', '/api/missions', { objective: obj('general'), nonce: nonce('G'), mode: 'delegate' });
+  const id1 = m1.json && (m1.json.missionId || m1.json.mission_id);
+  if (m1.status === 201 && m1.json.format) add('L5', m1.json.format.id === 'general' && m1.json.format.hash === hashOf('general') ? 'PASS' : 'FAIL', 'Mission with no format_id runs under "general" (bound hash equals /health)', `${m1.json.outcome}, tier ${m1.json.riskTier}`);
+  else add('L5', 'INCONCLUSIVE', 'Mission with no format_id runs under "general"', `HTTP ${m1.status} ${m1.error || (m1.json && m1.json.error) || ''}`);
+  data.general_mission = id1 || null;
+
+  // ---- mission 2: smme_finance
+  const m2 = await api('POST', '/api/missions', { objective: obj('smme'), nonce: nonce('S'), mode: 'delegate', format_id: 'smme_finance', mission_type: 'cashflow_review' });
+  const id2 = m2.json && (m2.json.missionId || m2.json.mission_id);
+  const refusal = m2.status === 502 && m2.json && /not allowed by this format/.test(m2.json.error || '');
+  if (m2.status === 201) add('L6', m2.json.outcome === 'AWAITING_APPROVAL' && !/^LOW$/i.test(m2.json.riskTier) && m2.json.format && m2.json.format.id === 'smme_finance' && m2.json.format.hash === hashOf('smme_finance') ? 'PASS' : 'FAIL', 'smme_finance mission is held for a human at tier medium or higher (never auto-completed)', `${m2.json.outcome}, tier ${m2.json.riskTier}`);
+  else if (refusal) add('L6', 'NOTE', 'smme_finance refused this deployment\'s seed host before any model call (restrict-only domain rule working; the full chain was not exercised)', m2.json.error);
+  else add('L6', 'INCONCLUSIVE', 'smme_finance mission', `HTTP ${m2.status} ${m2.error || (m2.json && m2.json.error) || ''}`);
+  data.smme_mission = id2 || null; data.smme_refusal_path = !!refusal;
+
+  // ---- negative requests (no model calls expected)
+  const neg = [await api('POST', '/api/missions', { objective: obj('neg1'), nonce: nonce('N1'), mode: 'delegate', format_id: 'nope_x' }), await api('POST', '/api/missions', { objective: obj('neg2'), nonce: nonce('N2'), mode: 'delegate', mission_type: 'cashflow_review' }), await api('POST', '/api/missions', { objective: 'x'.repeat(1500), nonce: nonce('N3'), mode: 'delegate', format_id: 'smme_finance' }),
+    await api('POST', '/api/missions', { objective: obj('neg4'), nonce: nonce('N4'), mode: 'DELEGATE' }), await api('POST', '/api/missions', { objective: obj('neg5'), nonce: nonce('N5'), mode: 'admin' })];
+  add('L7', neg.every(n => n.status === 400) ? 'PASS' : 'FAIL', 'Unknown format, undefined mission_type, an over-long objective under smme_finance, and invalid modes ("DELEGATE", "admin") are all refused with 400', neg.map(n => n.status).join(', '));
+
+  // ---- Router: ask and assist missions never execute
+  const ma = await api('POST', '/api/missions', { objective: obj('ask'), nonce: nonce('A'), mode: 'ask' }), mt = await api('POST', '/api/missions', { objective: obj('assist'), nonce: nonce('T'), mode: 'assist' });
+  const ida = ma.json && (ma.json.missionId || ma.json.mission_id), idt = mt.json && (mt.json.missionId || mt.json.mission_id);
+  if (ma.status === 201) add('L11', ma.json.outcome === 'ANSWERED' && ma.json.mode === 'ask' && ma.json.criticVerdict === null ? 'PASS' : 'FAIL', 'Ask mission ends ANSWERED (research + analysis only: no artifact, no Critic, nothing to approve or execute)', `${ma.json.outcome}, mode ${ma.json.mode}`);
+  else add('L11', 'INCONCLUSIVE', 'Ask mission', `HTTP ${ma.status} ${ma.error || (ma.json && ma.json.error) || ''}`);
+  if (mt.status === 201) add('L12', mt.json.outcome === 'DRAFT_READY' && mt.json.mode === 'assist' ? 'PASS' : 'FAIL', 'Assist mission ends DRAFT_READY (drafted and Critic-reviewed, held; nothing to approve or execute)', `${mt.json.outcome}, mode ${mt.json.mode}, critic ${mt.json.criticVerdict}`);
+  else add('L12', 'INCONCLUSIVE', 'Assist mission', `HTTP ${mt.status} ${mt.error || (mt.json && mt.json.error) || ''}`);
+  for (const [lab, id, st, md] of [['L11a', ida, 'ANSWERED', 'ask'], ['L12a', idt, 'DRAFT_READY', 'assist']]) {
+    if (!id) continue;
+    const e = await api('GET', `/api/memory/missions/${id}/explain`);
+    if (e.status !== 200 || !e.json) { add(lab, 'INCONCLUSIVE', `explain (${md})`, `HTTP ${e.status}`); continue; }
+    const x = e.json;
+    add(lab, x.status === st && x.router && x.router.status === 'consistent' && x.router.mode === md && x.execution && x.execution.executed === false && x.approval && x.approval.status === 'NOT REQUIRED' ? 'PASS' : 'FAIL', `explain (${md}): routing decision recorded and consistent, status ${st}, no approval needed, nothing executed`, `${x.status}; router ${x.router && x.router.status}; ${(x.narrative || []).find(n => /^Routing/.test(n)) || ''}`);
+    data['explain_' + md] = { status: x.status, router: x.router && { mode: x.router.mode, plan: x.router.plan_id, status: x.router.status }, executed: x.execution && x.execution.executed, approval: x.approval && x.approval.status };
+  }
+
+  // ---- re-read the evidence through Decision Memory
+  async function explainChecks(label, id, fmtId, expectAwaiting) {
+    if (!id) return;
+    const e = await api('GET', `/api/memory/missions/${id}/explain`);
+    if (e.status !== 200 || !e.json) return add(label + 'a', 'INCONCLUSIVE', `Decision Memory explain (${fmtId})`, `HTTP ${e.status} ${e.error || ''}`);
+    const x = e.json, codes = (x.format_effects || []).map(f => f.effect_code);
+    add(label + 'a', x.format && x.format.status === 'verified' && x.format.format_id === fmtId && x.format.manifest_hash === hashOf(fmtId) ? 'PASS' : 'FAIL', `explain (${fmtId}): stored manifest re-verified and its hash equals the one /health reports`, x.format && `${x.format.status} ${String(x.format.manifest_hash).slice(0, 12)}`);
+    add(label + 'b', codes.includes('format_bound') ? 'PASS' : 'FAIL', `explain (${fmtId}): policy effects were recorded as rows`, codes.join(', '));
+    if (expectAwaiting) {
+      if (refusal) add(label + 'c', codes.includes('domain_refused') && x.status === 'FAILED' && x.execution && x.execution.executed === false ? 'PASS' : 'FAIL', 'explain (smme_finance): refusal recorded, mission FAILED, nothing executed', `${x.status}; ${codes.join(', ')}`);
+      else add(label + 'c', ['floor_applied', 'human_required_for_all'].every(c => codes.includes(c)) && x.approval && x.approval.status === 'PENDING' && x.execution && x.execution.executed === false && !/^LOW$/i.test(x.risk && x.risk.tier) ? 'PASS' : 'FAIL', 'explain (smme_finance): floor and human-required effects recorded; approval PENDING; nothing executed', `${x.status}; tier ${x.risk && x.risk.tier}; ${codes.join(', ')}`);
+    }
+    data['explain_' + fmtId] = { status: x.status, tier: x.risk && x.risk.tier, approval: x.approval && x.approval.status, executed: x.execution && x.execution.executed, effects: codes, narrative_format_line: (x.narrative || []).find(s => /^Format /.test(s)) };
+  }
+  await explainChecks('L8', id1, 'general', false);
+  await explainChecks('L9', id2, 'smme_finance', true);
+
+  // ---- list + search
+  const ls = await api('GET', '/api/memory/missions?limit=10'), sr = await api('GET', '/api/memory/search?fields=request&limit=10&q=' + encodeURIComponent('LIVE FORMAT CHECK'));
+  const ids = [id1, id2].filter(Boolean);
+  add('L10', ls.status === 200 && ids.every(i => has(ls.json.items, m => m.id === i)) && sr.status === 200 && ids.every(i => has(sr.json.items, h2 => h2.provenance.mission_id === i)) ? 'PASS' : (ids.length ? 'FAIL' : 'INCONCLUSIVE'), 'Both missions appear in the Decision Memory list and in a search for their request text', `list ${ls.status}, search ${sr.status}`);
+
+  function finish() {
+    data.network_retries = retries;
+    const fails = checks.filter(c => c.status === 'FAIL'), inc = checks.filter(c => c.status === 'INCONCLUSIVE'), notes = checks.filter(c => c.status === 'NOTE');
+    const verdict = fails.length ? 'FAIL' : inc.length ? 'INCONCLUSIVE' : notes.length ? 'PASS (refusal path only)' : 'PASS';   // network_retries > 0 with PASS means a dropped connection was retried once
+    return { verdict, finished: new Date().toISOString(), counts: { pass: checks.filter(c => c.status === 'PASS').length, fail: fails.length, inconclusive: inc.length, note: notes.length }, checks, data };
+  }
+  return finish();
+}
+if (typeof globalThis !== 'undefined') globalThis.__runFormatCheck = runFormatCheck;
+
+if (typeof document !== 'undefined') {
+  const $ = id => document.getElementById(id), icon = { PASS: '✅', FAIL: '❌', INCONCLUSIVE: '⚠️', NOTE: 'ℹ️' };
+  let last = null;
+  function row(c) {
+    const r = document.createElement('div'); r.className = 'row ' + c.status;
+    const ic = document.createElement('div'); ic.className = 'ic'; ic.textContent = icon[c.status] || '•';
+    const t = document.createElement('div'); t.className = 't';
+    const a = document.createElement('div'); a.textContent = `${c.id} ${c.title}`;
+    const d = document.createElement('div'); d.className = 'd'; d.textContent = c.detail;
+    t.append(a, d); r.append(ic, t); $('checks').append(r);
+  }
+  $('go').onclick = async () => {
+    let wl = null, hidden = 0; const onVis = () => { if (document.hidden) hidden++; }; document.addEventListener('visibilitychange', onVis);
+    try { if (navigator.wakeLock) wl = await navigator.wakeLock.request('screen'); } catch {}
+    $('go').disabled = true; $('copy').disabled = true; $('checks').textContent = ''; $('out').textContent = ''; $('verdict').textContent = 'Running… (a sleeping instance can take a minute)';
+    try {
+      last = await runFormatCheck({ base: $('base').value.trim(), token: $('tok').value.trim() }, { onCheck: row });
+      last.data.page_hidden_events = hidden; last.data.screen_wake_lock = !!wl;
+      $('verdict').textContent = 'Verdict: ' + last.verdict + `  (${last.counts.pass} pass, ${last.counts.fail} fail, ${last.counts.inconclusive} inconclusive)`;
+      $('out').textContent = JSON.stringify(last, null, 2); $('copy').disabled = false;
+    } catch (e) { $('verdict').textContent = 'Error: ' + (e && e.message || e); }
+    document.removeEventListener('visibilitychange', onVis); try { wl && wl.release(); } catch {}
+    $('go').disabled = false;
+  };
+  $('copy').onclick = async () => { try { await navigator.clipboard.writeText($('out').textContent); $('copy').textContent = 'Copied'; } catch { $('copy').textContent = 'Select the text below and copy it'; } setTimeout(() => $('copy').textContent = 'Copy result JSON', 2500); };
+}
+</script>
+</body>
+</html>
