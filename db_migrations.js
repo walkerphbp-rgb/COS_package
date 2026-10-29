@@ -113,6 +113,45 @@ function migrateV3(db) {
   return r;
 }
 
+/* ---- Schema v4 (source-based research, Step 3). Additive and idempotent. ----
+ *  mission_research: the structured research request, one row per mission (append-only)
+ *  mission_sources: one row per source ATTEMPTED, ok or failed, with the extracted text actually given to the model,
+ *    rawSha256 (downloaded bytes) and textSha256 (model text) (append-only; PK mission_id+source_id)
+ *  claims.source_id: NULLABLE (older and legacy-seed claims stay NULL; research claims cite a stable source_id) */
+const V4_APPEND_ONLY = ['mission_research', 'mission_sources'];
+function migrateV4(db) {
+  const r = { applied: [], warnings: [] };
+  const has = (type, name) => !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type=? AND name=?`).get(type, name);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    if (!has('table', 'mission_research')) {
+      db.exec(`CREATE TABLE mission_research (mission_id TEXT PRIMARY KEY REFERENCES missions(id), question TEXT NOT NULL, scope TEXT NOT NULL,
+        constraints TEXT NOT NULL, desired_output TEXT NOT NULL, duplicates_json TEXT NOT NULL, created_at TEXT NOT NULL)`);
+      r.applied.push('mission_research');
+    }
+    if (!has('table', 'mission_sources')) {
+      db.exec(`CREATE TABLE mission_sources (mission_id TEXT NOT NULL REFERENCES missions(id), source_id TEXT NOT NULL,
+        url TEXT NOT NULL, final_url TEXT, redirects_json TEXT NOT NULL, host TEXT NOT NULL, label TEXT, input_index INTEGER NOT NULL,
+        ok INTEGER NOT NULL CHECK (ok IN (0, 1)), code TEXT NOT NULL, http_status INTEGER, content_type TEXT,
+        bytes_downloaded INTEGER NOT NULL, download_truncated INTEGER NOT NULL, raw_sha256 TEXT,
+        text TEXT NOT NULL, text_chars INTEGER NOT NULL, model_truncated INTEGER NOT NULL, text_sha256 TEXT,
+        connected_ip TEXT, attempted_at TEXT NOT NULL, retrieved_at TEXT, PRIMARY KEY (mission_id, source_id))`);
+      r.applied.push('mission_sources');
+    }
+    if (has('table', 'claims')) {
+      const cols = db.prepare('PRAGMA table_info(claims)').all().map(c => c.name);
+      if (!cols.includes('source_id')) { db.exec(`ALTER TABLE claims ADD COLUMN source_id TEXT`); r.applied.push('claims.source_id'); }
+    } else r.warnings.push('table claims missing; claims.source_id not added');
+    for (const t of V4_APPEND_ONLY) for (const op of ['UPDATE', 'DELETE']) {
+      const name = `cos_append_only_${t}_${op.toLowerCase()}`;
+      if (!has('trigger', name)) { db.exec(`CREATE TRIGGER ${name} BEFORE ${op} ON ${t} BEGIN SELECT RAISE(ABORT, 'append-only: ${op} on ${t} is not allowed'); END;`); r.applied.push(name); }
+    }
+    if (r.warnings.length) { db.exec('ROLLBACK'); return r; }
+    db.exec('COMMIT');
+  } catch (e) { try { db.exec('ROLLBACK'); } catch {} r.warnings.push(`schema v4 migration failed: ${e.message}`); }
+  return r;
+}
+
 /* Read-only check, for /health. */
 function guardStatus(db) {
   const want = [];
@@ -126,6 +165,9 @@ function guardStatus(db) {
     for (const op of ['update', 'delete']) want.push(['trigger', `cos_append_only_router_decisions_${op}`]);
     want.push(['trigger', V3_BINDING_TRIGGER], ['trigger', V3_EXEC_TRIGGER]);
   }
+  if (Number(Object.values(db.prepare('PRAGMA user_version').get())[0]) >= 4) {
+    for (const t of V4_APPEND_ONLY) for (const op of ['update', 'delete']) want.push(['trigger', `cos_append_only_${t}_${op}`]);
+  }
   const missing = want.filter(([ty, n]) => !db.prepare(`SELECT 1 FROM sqlite_master WHERE type=? AND name=?`).get(ty, n)).map(x => x[1]);
   return { ok: missing.length === 0, missing };
 }
@@ -133,12 +175,13 @@ function guardStatus(db) {
 /* ---- Schema versioning (PRAGMA user_version) ----
  * v0 = a DB that predates versioning (every DB created before this change, including production).
  * v1 = base test17 schema + the append-only guards from migrate(). Stamping v0 -> v1 changes no data.
+ * v4 = v3 + source-based research (mission_research, mission_sources, claims.source_id, their append-only guards).
  * v3 = v2 + routing binding (mode/plan columns, router_decisions, execution guard).
  * v2 = v1 + format binding (3 nullable missions columns, format_manifests, format_effects, their guards).
  * A DB stamped NEWER than this code understands is refused (an older build must not run on a newer
  * schema). A migration that throws, or that cannot create a required table/trigger, is FATAL.
  * A legacy-duplicate execution_log index skip stays non-fatal (documented in Test 21D-7). */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const CORE_TABLES = ['missions', 'decisions', 'execution_log', 'critic_reviews'];
 
 function migrateVersioned(db) {
@@ -158,11 +201,15 @@ function migrateVersioned(db) {
       const v2 = migrateV2(db);
       out.report.applied.push(...v2.applied);
       if (v2.warnings.length) { out.fatal = true; out.errors.push(...v2.warnings); }
-      else { const v3 = migrateV3(db); out.report.applied.push(...v3.applied); if (v3.warnings.length) { out.fatal = true; out.errors.push(...v3.warnings); } }
+      else {
+        const v3 = migrateV3(db); out.report.applied.push(...v3.applied);
+        if (v3.warnings.length) { out.fatal = true; out.errors.push(...v3.warnings); }
+        else { const v4 = migrateV4(db); out.report.applied.push(...v4.applied); if (v4.warnings.length) { out.fatal = true; out.errors.push(...v4.warnings); } }
+      }
     }
     if (!out.fatal && out.version_before < SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     out.version_after = getV();
   } catch (e) { out.fatal = true; out.errors.push(`migration failed: ${e.message}`); }
   return out;
 }
-module.exports = { migrate, migrateV2, migrateV3, guardStatus, APPEND_ONLY, V2_APPEND_ONLY, SCHEMA_VERSION, CORE_TABLES, migrateVersioned };
+module.exports = { migrate, migrateV2, migrateV3, migrateV4, V4_APPEND_ONLY, guardStatus, APPEND_ONLY, V2_APPEND_ONLY, SCHEMA_VERSION, CORE_TABLES, migrateVersioned };

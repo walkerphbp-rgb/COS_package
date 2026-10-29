@@ -67,7 +67,7 @@ async function runFormatCheck(cfg, deps) {
   if (h.status !== 200 || !h.json) { add('L1', 'INCONCLUSIVE', 'Backend reachable', h.error || `HTTP ${h.status}`); return finish(); }
   add('L1', 'PASS', 'Backend reachable', `version ${h.json.version}, mode ${h.json.mode}`);
   const H = h.json;
-  add('L2', H.db && H.db.schema && H.db.schema.user_version === 3 && H.db.schema.ok && H.db.guards && H.db.guards.ok ? 'PASS' : 'FAIL', 'Schema v3 and database guards OK', H.db && JSON.stringify({ v: H.db.schema && H.db.schema.user_version, guards: H.db.guards && H.db.guards.ok }));
+  add('L2', H.db && H.db.schema && H.db.schema.user_version === 4 && H.db.schema.ok && H.db.guards && H.db.guards.ok ? 'PASS' : 'FAIL', 'Schema v4 and database guards OK', H.db && JSON.stringify({ v: H.db.schema && H.db.schema.user_version, guards: H.db.guards && H.db.guards.ok }));
   const loaded = (H.formats && H.formats.loaded) || [], hashOf = id => (loaded.find(f => f.id === id) || {}).hash;
   add('L3', /^[0-9a-f]{64}$/.test(hashOf('general') || '') && /^[0-9a-f]{64}$/.test(hashOf('smme_finance') || '') ? 'PASS' : 'FAIL', 'Formats general and smme_finance are loaded with hashes', loaded.map(f => `${f.id}@${f.version}:${String(f.hash).slice(0, 12)}`).join(', '));
   add('L4', H.formats && H.formats.default === 'general' ? 'PASS' : 'FAIL', 'Default format is general', H.formats && H.formats.default);

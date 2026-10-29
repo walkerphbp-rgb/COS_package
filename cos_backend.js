@@ -48,6 +48,11 @@
  *   COS_FORMATS_DIR      directory of format manifests (default ./formats); invalid => refuse to boot (exit 5)
  *   COS_DEFAULT_FORMAT   format used when a mission names none (default "general")
  *   COS_ALLOWED_FORMATS  comma list of formats a mission may select (default: all loaded)
+ *   COS_RESEARCH_HOSTS   comma list of EXACT hostnames user-supplied research sources may use. Unset/empty = source-based research is
+ *                        DISABLED (POST /api/missions with a "research" object is refused). Any entry that is not a plain DNS
+ *                        hostname refuses to boot. A format's evidence.source_domains narrows this list further; neither widens the other.
+ *                        Research missions run in ask mode only. GET /api/missions/:id/research is read-only; access model is unchanged:
+ *                        ONE workspace, every valid operator token can read every mission (no per-user or multi-tenant separation).
  *   COS_DEFAULT_MODE     mode used when a mission names none: ask | assist | delegate (default "ask"; anything else
  *                        refuses to boot; a non-ask value is shown in /health as elevated)
  *   COS_B2_BACKUP=1      OPT-IN off-site backup to Backblaze B2 (S3 API): verified snapshots + restore-if-the-local-DB-is-missing.
@@ -102,6 +107,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { runLiveMission } = require('./mission_chain');
+const researchReq = require('./research_request');
 const { gateExecuteInTx } = require('./gate');
 const { guardStatus, migrateVersioned, SCHEMA_VERSION } = require('./db_migrations');
 const persistence = require('./persistence');
@@ -393,6 +399,7 @@ function health(req, res) {
     formats: { schema_version: formatLoader.FORMAT_SCHEMA_VERSION, default: FORMAT_CFG.default, allowed: FORMAT_CFG.allowed, loaded: [...FORMATS.values()].map(f => ({ id: f.id, version: f.version, hash: f.hash })) },
     backup: B2.manager ? B2.manager.status() : { enabled: false },
     router: { default_mode: DEFAULT_MODE, default_mode_elevated: DEFAULT_MODE !== 'ask', modes: router.MODES, plans: Object.values(router.PLANS).map(p => ({ id: p.id, version: p.version, mode: p.mode })) },
+    research: { enabled: RESEARCH_HOSTS.length > 0, host_count: RESEARCH_HOSTS.length, modes: ['ask'], legacy_seed_route: true },
     persistence: persistenceBlock, init: { enabled: INIT_DB, result: INIT_RESULT }, shutting_down: shuttingDown, time: nowISO() });
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', ...SEC });
   res.end(req.method === 'HEAD' ? undefined : body);
@@ -452,6 +459,15 @@ const server = http.createServer(async (req, res) => {
       const nonce = typeof body.nonce === 'string' ? body.nonce.trim() : '';
       const sel = formatLoader.selectForRequest(FORMATS, FORMAT_CFG, { format_id: body.format_id, mission_type: body.mission_type });   // 400 if not available
       const decision = router.route({ requested: body.mode === undefined ? undefined : router.parseMode(body.mode), formatMaxMode: sel.format.effective.router.max_mode, defaultMode: DEFAULT_MODE });   // 400 on any invalid mode; only the JSON body is read
+      // Step 3: source-based research. absent => legacy seed route (labelled demo/legacy); present but malformed => 400, never falls back to the seed.
+      let rq = null;
+      if (body && typeof body === 'object' && !Array.isArray(body) && body.research !== undefined) {
+        if (!RESEARCH_HOSTS.length) return send(res, 400, { ok: false, code: 'RESEARCH_DISABLED', error: 'Source-based research is disabled on this server (COS_RESEARCH_HOSTS is not set). Nothing was run.' });
+        const pr = researchReq.parseResearch(body, { operatorHosts: RESEARCH_HOSTS, formatHosts: sel.format.effective.evidence.source_domains });
+        if (pr.kind !== 'ok') return send(res, 400, { ok: false, code: 'RESEARCH_INVALID', error: 'research request is invalid; nothing was run and the seed document was not used', errors: pr.errors });
+        if (decision.effective !== 'ask') return send(res, 400, { ok: false, code: 'RESEARCH_ASK_ONLY', error: `source-based research runs in ask mode only (effective mode would be "${decision.effective}"); nothing was run` });
+        rq = { request: pr.research, duplicates: pr.duplicates, operatorHosts: RESEARCH_HOSTS };
+      }
       const maxObjective = sel.format.effective.limits.objective_max_chars;
       if (objective.length < 10 || objective.length > maxObjective) return send(res, 400, { ok: false, error: `objective must be 10-${maxObjective} characters` });
       if (!/^[A-Za-z0-9_-]{6,64}$/.test(nonce)) return send(res, 400, { ok: false, error: 'nonce is required: 6-64 chars, letters/digits/_/- only' });
@@ -460,13 +476,13 @@ const server = http.createServer(async (req, res) => {
         const result = await runLiveMission(db, {
           requestText: objective, nonce, seedUrl: MISSION_SEED_URL,
           format: { id: sel.format.id, version: sel.format.version, hash: sel.format.hash, policy: sel.format.effective, missionType: sel.missionType },
-          route: decision,
+          route: decision, research: rq || undefined,
           keys: { gemini: GEMINI_API_KEY, groq: GROQ_API_KEY || null },
           models: MODELS,
         });
         logEvent(result.missionId, 'MISSION_SUBMITTED',
           `by ${actor}, mode=${result.mode}, format=${result.format.id}@${result.format.version}, outcome=${result.outcome}, provider_used=${result.providerUsed}, nonce_verified=${result.nonceVerifiedInProviderResponse && result.nonceVerifiedInArtifact}`, actor);
-        return send(res, 201, { ok: true, ...result });
+        return send(res, 201, { ok: true, ...result, research_route: rq ? 'user_sources' : 'legacy_seed_demo' });
       } catch (e) {
         const failedId = (e && e.missionId) || null;
         // Decisions are append-only: record the terminal FAILED state as a new row
@@ -480,6 +496,15 @@ const server = http.createServer(async (req, res) => {
         logEvent(failedId, 'MISSION_FAILED', `by ${actor}: ${e.message}`, actor);
         return send(res, 502, { ok: false, error: e.message, mission_id: failedId });
       } finally { try { db.close(); } catch {} }
+    }
+
+    /* Source-based research record (read-only; same query_only handle as Decision Memory). */
+    const rr = /^\/api\/missions\/([A-Za-z0-9_-]{1,64})\/research$/.exec(url.pathname);
+    if (req.method === 'GET' && rr) {
+      if (!fs.existsSync(DB_PATH)) return send(res, 503, { ok: false, error: 'Database file not found' });
+      const mdb = memory.openMemoryDb(DB_PATH, persistence.BUSY_TIMEOUT_MS);
+      try { const v = researchReq.researchView(mdb, rr[1]); return v ? send(res, 200, { ok: true, ...v }) : send(res, 404, { ok: false, error: 'No research record for this mission (not found, or it used the legacy seed route)' }); }
+      finally { try { mdb.close(); } catch {} }
     }
 
     const m = /^\/api\/missions\/([A-Za-z0-9_-]{1,64})\/decision$/.exec(url.pathname);
@@ -536,15 +561,17 @@ if (!READONLY && fs.existsSync(DB_PATH)) {
   try { const d = new DatabaseSync(DB_PATH); try { d.exec(`PRAGMA busy_timeout = ${persistence.BUSY_TIMEOUT_MS}`); } finally { d.close(); } } catch {}
 }
 /* ---------------- formats (FORMAT_SPECIFICATION.md). Invalid format files or selection config => REFUSE TO START. ---------------- */
-let FORMATS = null, FORMAT_CFG = null, DEFAULT_MODE = 'ask';
+let FORMATS = null, FORMAT_CFG = null, DEFAULT_MODE = 'ask', RESEARCH_HOSTS = [];
 try {
   FORMATS = formatLoader.loadFormatsDir(process.env.COS_FORMATS_DIR ? path.resolve(process.env.COS_FORMATS_DIR) : path.join(__dirname, 'formats'));
   FORMAT_CFG = formatLoader.selectionConfig(process.env, FORMATS);
   DEFAULT_MODE = router.defaultModeFromEnv(process.env);   // invalid => throws => refuse to boot
+  RESEARCH_HOSTS = researchReq.researchHostsFromEnv(process.env);   // invalid entry => throws => refuse to boot
   if (!READONLY && fs.existsSync(DB_PATH)) {
     const d = new DatabaseSync(DB_PATH);
     try { d.exec(`PRAGMA busy_timeout = ${persistence.BUSY_TIMEOUT_MS}`); formatLoader.registerFormats(d, FORMATS); } finally { d.close(); }
   }
+  console.log(`Research: ${RESEARCH_HOSTS.length ? `ENABLED for ${RESEARCH_HOSTS.length} operator host(s)` : 'DISABLED (COS_RESEARCH_HOSTS not set)'}`);
   console.log(`Router: default_mode=${DEFAULT_MODE}${DEFAULT_MODE !== 'ask' ? ' (ELEVATED by COS_DEFAULT_MODE)' : ''}`);
   console.log(`Formats: ${[...FORMATS.values()].map(f => `${f.id}@${f.version}`).join(', ')} | default=${FORMAT_CFG.default} allowed=${FORMAT_CFG.allowed.join(',')}`);
 } catch (e) {
