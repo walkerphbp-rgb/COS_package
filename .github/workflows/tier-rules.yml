@@ -2,7 +2,7 @@ name: tier-rules
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
 
 jobs:
