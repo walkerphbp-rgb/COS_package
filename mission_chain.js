@@ -241,6 +241,12 @@ const { ENGINE_DEFAULTS, TIER_RANK } = require('./format_loader');
 const { planOf } = require('./router');
 const MIN_SNIPPET = ENGINE_DEFAULTS.evidence.min_snippet_chars;   // engine default; a format may only raise it
 const normWs = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+const optStr = (v) => v === undefined || v === null || typeof v === 'string';
+function claimBindable(c) {
+  return !!c && typeof c === 'object' && typeof c.text === 'string' && c.text.length > 0 &&
+    typeof c.confidence === 'number' && Number.isFinite(c.confidence) &&
+    optStr(c.source_url) && optStr(c.evidence_snippet);
+}
 function isGrounded(grounding, claim, seedUrl) {
   if (!grounding || grounding.error || !(grounding.statusCode >= 200 && grounding.statusCode < 300) || !(grounding.bytes > 0)) return false;
   if (!claim || claim.source_url !== seedUrl) return false;
