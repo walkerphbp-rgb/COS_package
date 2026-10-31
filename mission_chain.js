@@ -163,7 +163,7 @@ const SCHEMA_HINTS = {
 
 function validateResearcher(nonce) {
   return (resp) => resp && Array.isArray(resp.claims) && resp.claims.length > 0 &&
-    resp.claims.every((c) => typeof c.text === 'string' && c.text.length > 0 &&
+    resp.claims.every((c) => c && typeof c.text === 'string' && c.text.length > 0 &&
       typeof c.source_url === 'string' && typeof c.evidence_snippet === 'string' &&
       typeof c.confidence === 'number') &&
     resp.verification_token === nonce &&

@@ -2,8 +2,8 @@
 // Schema-invalid researcher claims must never crash the mission with "cannot be bound to SQLite parameter N".
 // Run: node test_schema_invalid_claims.js
 // Network fully stubbed (global.fetch). Exit codes: 0 pass, 1 test failure, 2 harness error.
-// Self-check: unless COS_MUTANT=1, the file copies the runtime tree to a temp dir, disables the claimBindable guard
-// there, re-runs itself and requires the copy to FAIL (prints MUTATION-DETECTED). If the mutation does not apply or
+// Self-check: unless COS_MUTANT=1, the file copies the runtime tree to a temp dir, disables, in turn, the claimBindable guard and the
+// validateResearcher null guard there, re-runs itself and requires each copy to FAIL (prints MUTATION-DETECTED). If the mutation does not apply or
 // the copy passes, this file exits non-zero.
 const assert = require('assert');
 const fs = require('fs'), os = require('os'), path = require('path');
@@ -63,13 +63,24 @@ for (const [label, bad] of Object.entries(BAD)) {
     assert.ok(d && /0 claim\(s\) recorded \(1 unstorable claim\(s\) skipped\)/.test(d.rationale), d && d.rationale);
   });
 }
-T('1k KNOWN GAP (pinned, not fixed): a null element in claims makes validateResearcher throw before claimBindable runs; the mission fails with a TypeError, no fallback, nothing persisted', async () => {
+T('1k null claim element: validate() rejects the response without throwing, falls back, null is skipped, mission continues', async () => {
   const body = { claims: [null], verification_token: NONCE }; setProviders(body, body);
-  const db = newDb();
-  await assert.rejects(research(db), (e) => e instanceof TypeError && /reading 'text'/.test(e.message));
-  assert.deepStrictEqual(calls, ['seed', 'gemini']);   // no Groq fallback attempted
-  assert.strictEqual(n(db, 'provider_calls'), 0); assert.strictEqual(n(db, 'claims'), 0);
-  // If validateResearcher is hardened (guard `c &&` in .every), this check will fail: update it to expect skip-and-continue.
+  const db = newDb(); const r = await research(db);
+  assert.deepStrictEqual(calls, ['seed', 'gemini', 'groq']);   // schema-invalid on Gemini => Groq fallback attempted
+  assert.strictEqual(r.claimIds.length, 0); assert.strictEqual(n(db, 'claims'), 0); assert.strictEqual(r.tokenVerified, false);
+  assert.strictEqual(db.prepare('SELECT schema_valid FROM provider_calls').get().schema_valid, 0);
+  assert.match(db.prepare(`SELECT rationale FROM decisions WHERE status='RESEARCHED'`).get().rationale, /0 claim\(s\) recorded \(1 unstorable claim\(s\) skipped\)/);
+});
+T('1l null element beside a valid claim, both providers: valid claim stored, null skipped', async () => {
+  const body = { claims: [good, null], verification_token: NONCE }; setProviders(body, body);
+  const db = newDb(); const r = await research(db);
+  assert.strictEqual(r.claimIds.length, 1); assert.strictEqual(n(db, 'claims'), 1); assert.strictEqual(r.tokenVerified, false);
+  assert.match(db.prepare(`SELECT rationale FROM decisions WHERE status='RESEARCHED'`).get().rationale, /1 claim\(s\) recorded \(1 unstorable claim\(s\) skipped\)/);
+});
+T('1m Gemini returns a null element, Groq valid: falls back and stores the valid claim', async () => {
+  setProviders({ claims: [good, null], verification_token: NONCE }, { claims: [good], verification_token: NONCE });
+  const db = newDb(); const r = await research(db);
+  assert.deepStrictEqual(calls, ['seed', 'gemini', 'groq']); assert.strictEqual(r.providerUsed, 'groq'); assert.strictEqual(r.tokenVerified, true); assert.strictEqual(r.claimIds.length, 1);
 });
 T('2 mixed: one bindable + one unbindable claim: only the bindable one is stored, skip count recorded', async () => {
   const body = { claims: [good, { ...good, source_url: [SEED] }], verification_token: NONCE + 'x' };   // wrong token => schema-invalid
@@ -105,17 +116,20 @@ async function main() {
   if (failed) process.exit(1);
   if (process.env.COS_MUTANT === '1') return;
   // ---- mutation self-check -------------------------------------------------------------------------------
-  const GUARD = 'if (!claimBindable(c)) { skippedClaims++; continue; }';
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cos-mut-'));
-  for (const f of fs.readdirSync(__dirname)) if (/\.(js|json|sql)$/.test(f) || f === 'formats') {
-    fs.cpSync(path.join(__dirname, f), path.join(tmp, f), { recursive: true });
+  const MUTANTS = [
+    ['claimBindable guard', 'if (!claimBindable(c)) { skippedClaims++; continue; }', '/* mutant: guard removed */'],
+    ['validateResearcher null guard', "resp.claims.every((c) => c && typeof c.text", "resp.claims.every((c) => typeof c.text"],
+  ];
+  for (const [label, from, to] of MUTANTS) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cos-mut-'));
+    for (const f of fs.readdirSync(__dirname)) if (/\.(js|json|sql)$/.test(f) || f === 'formats') fs.cpSync(path.join(__dirname, f), path.join(tmp, f), { recursive: true });
+    const mc = path.join(tmp, 'mission_chain.js'); const src = fs.readFileSync(mc, 'utf8');
+    if (src.split(from).length !== 2) { console.error(`HARNESS ERROR: mutation "${label}" does not apply exactly once`); process.exit(2); }
+    fs.writeFileSync(mc, src.replace(from, to));
+    const r = spawnSync(process.execPath, [path.join(tmp, 'test_schema_invalid_claims.js')], { cwd: tmp, env: { ...process.env, COS_MUTANT: '1' }, encoding: 'utf8' });
+    fs.rmSync(tmp, { recursive: true, force: true });
+    if (r.status === 1 && /FAIL/.test(r.stdout)) console.log(`MUTATION-DETECTED: removing the ${label} makes this test fail`);
+    else { console.error(`MUTATION NOT DETECTED for ${label} (child exit ${r.status})`); process.exit(r.status === 0 ? 1 : 2); }
   }
-  const mc = path.join(tmp, 'mission_chain.js'); const src = fs.readFileSync(mc, 'utf8');
-  if (!src.includes(GUARD)) { console.error('HARNESS ERROR: guard line not found; mutation cannot be applied'); process.exit(2); }
-  fs.writeFileSync(mc, src.replace(GUARD, '/* mutant: guard removed */'));
-  const r = spawnSync(process.execPath, [path.join(tmp, 'test_schema_invalid_claims.js')], { cwd: tmp, env: { ...process.env, COS_MUTANT: '1' }, encoding: 'utf8' });
-  fs.rmSync(tmp, { recursive: true, force: true });
-  if (r.status === 1 && /FAIL/.test(r.stdout)) console.log('MUTATION-DETECTED: removing the claimBindable guard makes this test fail');
-  else { console.error(`MUTATION NOT DETECTED (child exit ${r.status}); the test does not protect the guard`); process.exit(r.status === 0 ? 1 : 2); }
 }
 main().catch((e) => { console.error('HARNESS ERROR', e); process.exit(2); });
