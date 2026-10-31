@@ -26,12 +26,26 @@ jobs:
       - name: Run 22 (grounding, fixed)
         run: node test22_grounding.js fixed
       # Mutation checks: the same tests MUST fail against the old code, proving they detect the defects.
-      - name: Mutation check - gate original must FAIL
+      - name: Mutation check - gate original must be DETECTED
         run: |
-          if node test20_gate.js original; then echo "test20 passed on the original gate: tests do not detect the defects"; exit 1; fi
-      - name: Mutation check - grounding original must FAIL
+          # exit 1 + MUTATION-DETECTED = tests caught the old defects (pass); exit 2 = harness error (fail); exit 0 = not detected (fail)
+          set +e
+          out=$(node test20_gate.js original 2>&1)
+          rc=$?
+          echo "$out"
+          if [ "$rc" -eq 2 ]; then echo "test20 harness error (not a detection)"; exit 1; fi
+          if [ "$rc" -eq 0 ]; then echo "test20 passed on the original gate: tests do not detect the defects"; exit 1; fi
+          if ! echo "$out" | grep -qx 'MUTATION-DETECTED'; then echo "test20 failed without a MUTATION-DETECTED line"; exit 1; fi
+      - name: Mutation check - grounding original must be DETECTED
         run: |
-          if node test22_grounding.js original; then echo "test22 passed on the original grounding: tests do not detect the defects"; exit 1; fi
+          # exit 1 + MUTATION-DETECTED = tests caught the old defects (pass); exit 2 = harness error (fail); exit 0 = not detected (fail)
+          set +e
+          out=$(node test22_grounding.js original 2>&1)
+          rc=$?
+          echo "$out"
+          if [ "$rc" -eq 2 ]; then echo "test22 harness error (not a detection)"; exit 1; fi
+          if [ "$rc" -eq 0 ]; then echo "test22 passed on the original grounding: tests do not detect the defects"; exit 1; fi
+          if ! echo "$out" | grep -qx 'MUTATION-DETECTED'; then echo "test22 failed without a MUTATION-DETECTED line"; exit 1; fi
       - name: Run 23 (persistence safety, local)
         run: node test23_persistence.js
       - name: Run 24 (entrypoint + Dockerfile readiness; behavioural half skips when not root)
@@ -53,4 +67,4 @@ jobs:
       - name: Provider timeout tests
         run: node test_provider_timeout.js
       - name: Test transport errors and grounding timeout
-        run: node test_transport_and_grounding.js       
+        run: node test_transport_and_grounding.js
