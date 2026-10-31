@@ -4,24 +4,32 @@
  * network boundary: the seed URL and Gemini only. Any other URL fails the test.
  * 'original' loads a temp copy of mission_chain.js with the isGrounded() call swapped back to the
  * old check (first 30 chars of the snippet, no URL / status / empty-snippet checks) so the harness
- * proves these tests detect the old defects. */
+ * proves these tests detect the old defects. The temp copy contains the WHOLE runtime tree, so new
+ * requires in mission_chain.js cannot rot the harness.
+ * Exit codes: 0 = all checks pass ('fixed') or mutation NOT detected ('original', a CI failure);
+ *             1 = a check failed ('fixed') or 'MUTATION-DETECTED' printed ('original');
+ *             2 = harness error (usage, missing call site, module load, exception). Never a detection. */
 const fs = require('fs'), os = require('os'), path = require('path'), crypto = require('crypto');
 const { DatabaseSync } = require('node:sqlite');
 const target = process.argv[2];
 if (target !== 'original' && target !== 'fixed') { console.error('usage: node test22_grounding.js <original|fixed>'); process.exit(2); }
 
+function harnessError(msg) { console.error('HARNESS-ERROR: ' + msg); process.exit(2); }
+
 let chainPath = path.join(__dirname, 'mission_chain.js');
 if (target === 'original') {
   const src = fs.readFileSync(chainPath, 'utf8');
   const call = 'isGrounded(grounding, c, seedUrl)';
-  if (!src.includes(call)) { console.error('cannot build original: isGrounded call not found'); process.exit(2); }
+  if (!src.includes(call)) harnessError('cannot build original: isGrounded call not found');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 't22-'));
-  for (const f of ['provider_fallback.js', 'gate.js']) fs.copyFileSync(path.join(__dirname, f), path.join(dir, f));
+  // copy the whole runtime tree (modules, formats/, sql), not a hand-picked file list
+  fs.cpSync(__dirname, dir, { recursive: true, filter: (p) => !/(^|[\\/])(node_modules|\.git)([\\/]|$)|\.db(-wal|-shm)?$/.test(p) });
   fs.writeFileSync(path.join(dir, 'mission_chain.js'),
     src.replace(call, "(grounding.bytes > 0 && grounding.content.includes((c.evidence_snippet || '').slice(0, 30)))"));
   chainPath = path.join(dir, 'mission_chain.js');
 }
-const chain = require(chainPath);
+let chain;
+try { chain = require(chainPath); } catch (e) { harnessError('cannot load ' + chainPath + ': ' + (e && e.message)); }
 const schema = fs.readFileSync(path.join(__dirname, 'test17_schema.sql'), 'utf8');
 
 const SEED = 'https://example.test/readme';
@@ -41,8 +49,8 @@ global.fetch = async (url) => {
   throw new Error(`UNEXPECTED NETWORK CALL: ${url}`);
 };
 
-const results = [];
-function check(label, ok, detail) { results.push(ok); console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${ok ? '' : '  <- ' + detail}`); }
+const results = [], labels = [];
+function check(label, ok, detail) { results.push(ok); labels.push(label); console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${ok ? '' : '  <- ' + detail}`); }
 
 async function run(label, { page, c, expectMatch, expectTier }) {
   seed = page || { status: 200, body: PAGE };
@@ -68,9 +76,21 @@ async function run(label, { page, c, expectMatch, expectTier }) {
     await run('G4 HTTP 404 page that contains the snippet', { page: { status: 404, body: PAGE }, expectMatch: 0, expectTier: 'high' });
     await run('G5 whitespace-only differences still ground', { c: { evidence_snippet: 'Timeouts are   configurable\nper client.' }, expectMatch: 1, expectTier: 'low' });
     check('network guard: only the seed URL and Gemini were called', calls.every((u) => u === SEED || u.startsWith('https://generativelanguage.googleapis.com/')), calls.join(','));
-  } catch (e) { check('run completed without exception', false, e && e.message); }
+  } catch (e) {
+    global.fetch = realFetch;
+    if (target === 'original') harnessError('exception during original run (not a detection): ' + (e && e.message));
+    check('run completed without exception', false, e && e.message);
+  }
   global.fetch = realFetch;
   const p = results.filter(Boolean).length;
   console.log(`TEST22 target=${target} passed=${p} failed=${results.length - p}`);
+  if (target === 'original') {
+    const sentinelOk = results.length > 0 && labels.every((l, i) => !l.startsWith('G0') || results[i]);
+    const othersFailed = labels.some((l, i) => !l.startsWith('G0') && !results[i]);
+    if (!sentinelOk) harnessError('G0 sentinel failed on the original: harness is broken, not a detection');
+    if (othersFailed) { console.log('MUTATION-DETECTED'); process.exit(1); }
+    console.log('MUTATION-NOT-DETECTED: the old check passed every test, so these tests do not catch the old defects');
+    process.exit(0);
+  }
   process.exit(results.length === p ? 0 : 1);
 })();
